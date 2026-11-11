@@ -259,6 +259,45 @@ class PPOAgent:
         return masked.argmax(dim=-1).cpu().numpy().astype(np.int64)
 
     # ------------------------------------------------------------------ #
+    # Instrumentation [V2]
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def sl_agreement(self, transitions, batch_size=1024):
+        """Accord top-1 entre la policy courante et le discard SL figé,
+        sur les états du batch (entrée = celle vue à la collection,
+        oracle masqué tel que stocké dans la transition).
+
+        Instrument anti-dérive de l'effondrement rl_nooracle_v1 : à
+        l'init policy == SL (oracle nul -> canaux oracle muets) donc
+        accord = 1.000 exactement ; il ne peut que descendre. Règle de
+        lecture : < 0.95 = dérive notable, < 0.90 = alarme, < 0.85 =
+        la policy n'a plus rien à voir avec le SL (arrêter le run).
+
+        Retour : float dans [0, 1] (None si batch vide).
+        """
+        if not transitions:
+            return None
+        n_agree, n_tot = 0, 0
+        for s in range(0, len(transitions), batch_size):
+            chunk = transitions[s:s + batch_size]
+            on = torch.as_tensor(
+                np.stack([t['obs_normal'] for t in chunk]),
+                dtype=torch.float32, device=self.device)
+            oo = torch.as_tensor(
+                np.stack([t['obs_oracle'] for t in chunk]),
+                dtype=torch.float32, device=self.device)
+            m = torch.as_tensor(
+                np.stack([t['mask'] for t in chunk]),
+                dtype=torch.float32, device=self.device)
+            logits = self.policy(torch.cat([on, oo], dim=1))
+            rl_top = (logits + (m - 1.0) * 1e9).argmax(dim=-1)
+            sl_logits = self.sl_discard(on)
+            sl_top = (sl_logits + (m - 1.0) * 1e9).argmax(dim=-1)
+            n_agree += int((rl_top == sl_top).sum().item())
+            n_tot += len(chunk)
+        return n_agree / max(n_tot, 1)
+
+    # ------------------------------------------------------------------ #
     # Évaluation PPO
     # ------------------------------------------------------------------ #
     def evaluate_actions(self, obs_n, obs_o_masked, obs_o_full, masks,

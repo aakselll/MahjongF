@@ -1,0 +1,317 @@
+diff --git a/mahjong_ai/rl/agent.py b/mahjong_ai/rl/agent.py
+index 696c325..9cfa9d7 100644
+--- a/mahjong_ai/rl/agent.py
++++ b/mahjong_ai/rl/agent.py
+@@ -258,6 +258,45 @@ class PPOAgent:
+         masked = logits + (mask_t - 1.0) * 1e9
+         return masked.argmax(dim=-1).cpu().numpy().astype(np.int64)
+ 
++    # ------------------------------------------------------------------ #
++    # Instrumentation [V2]
++    # ------------------------------------------------------------------ #
++    @torch.no_grad()
++    def sl_agreement(self, transitions, batch_size=1024):
++        """Accord top-1 entre la policy courante et le discard SL figé,
++        sur les états du batch (entrée = celle vue à la collection,
++        oracle masqué tel que stocké dans la transition).
++
++        Instrument anti-dérive de l'effondrement rl_nooracle_v1 : à
++        l'init policy == SL (oracle nul -> canaux oracle muets) donc
++        accord = 1.000 exactement ; il ne peut que descendre. Règle de
++        lecture : < 0.95 = dérive notable, < 0.90 = alarme, < 0.85 =
++        la policy n'a plus rien à voir avec le SL (arrêter le run).
++
++        Retour : float dans [0, 1] (None si batch vide).
++        """
++        if not transitions:
++            return None
++        n_agree, n_tot = 0, 0
++        for s in range(0, len(transitions), batch_size):
++            chunk = transitions[s:s + batch_size]
++            on = torch.as_tensor(
++                np.stack([t['obs_normal'] for t in chunk]),
++                dtype=torch.float32, device=self.device)
++            oo = torch.as_tensor(
++                np.stack([t['obs_oracle'] for t in chunk]),
++                dtype=torch.float32, device=self.device)
++            m = torch.as_tensor(
++                np.stack([t['mask'] for t in chunk]),
++                dtype=torch.float32, device=self.device)
++            logits = self.policy(torch.cat([on, oo], dim=1))
++            rl_top = (logits + (m - 1.0) * 1e9).argmax(dim=-1)
++            sl_logits = self.sl_discard(on)
++            sl_top = (sl_logits + (m - 1.0) * 1e9).argmax(dim=-1)
++            n_agree += int((rl_top == sl_top).sum().item())
++            n_tot += len(chunk)
++        return n_agree / max(n_tot, 1)
++
+     # ------------------------------------------------------------------ #
+     # Évaluation PPO
+     # ------------------------------------------------------------------ #
+diff --git a/mahjong_ai/rl/ppo.py b/mahjong_ai/rl/ppo.py
+index 8593ace..763c3f5 100644
+--- a/mahjong_ai/rl/ppo.py
++++ b/mahjong_ai/rl/ppo.py
+@@ -38,6 +38,12 @@ def compute_advantages(agent, transitions, mode='batch_mean',
+     critic non encore entraîné ajoute du bruit au lieu d'en retirer).
+ 
+     Retour (advantages, info) ; pose t['advantage'] sur chaque transition.
++
++    [V2] info contient adv_var_raw : variance de l'avantage AVANT
++    normalisation (unités reward^2). C'est la métrique qui mesure ce que
++    la baseline retire au bruit : batch_mean -> Var(G) ; critic ->
++    Var(G - V(s)). Chute de adv_var_raw = le critic absorbe la variance
++    d'état (hidden info) que la policy ne contrôle pas.
+     """
+     returns = np.array([t['return'] for t in transitions], dtype=np.float32)
+     values = None
+@@ -65,13 +71,15 @@ def compute_advantages(agent, transitions, mode='batch_mean',
+             advs = resid
+             used_critic = True
+ 
++    adv_var_raw = float(advs.var()) if len(advs) > 1 else 0.0
+     if len(advs) > 1 and advs.std() > 1e-6:
+         advs = (advs - advs.mean()) / (advs.std() + 1e-8)
+     for i, tr in enumerate(transitions):
+         tr['advantage'] = float(advs[i])
+     info = {'ev': ev, 'used_critic': used_critic,
+             'ret_mean': float(returns.mean()),
+-            'ret_std': float(returns.std())}
++            'ret_std': float(returns.std()),
++            'adv_var_raw': adv_var_raw}
+     return advs, info
+ 
+ 
+@@ -79,14 +87,20 @@ def ppo_update(agent, transitions, epochs=4, minibatch=512,
+                clip_eps=0.2, value_clip=0.2, value_coef=0.5,
+                entropy_coef=0.0, kl_coef=0.0, grad_clip=0.5,
+                reward_scale=10.0, iw_threshold=None, warmup=False,
+-               lr_policy=None, lr_critic=None):
++               lr_policy=None, lr_critic=None, target_kl=None):
+     """Une itération PPO complète sur le batch collecté.
+ 
+     warmup=True : seul le critic est optimisé (policy figée) — utilisé au
+     démarrage en --adv-mode critic.
+     lr_policy/lr_critic : surcharge ponctuelle du LR (phases).
+-
+-    Retour : dict de métriques.
++    target_kl : [V2] early-stop PPO — si la KL moyenne old->new dépasse
++    1.5 x target_kl, les epochs/minibatchs restants sont sautés. Avec la
++    baseline critic le gradient par update est plus fort : sans garde-fou,
++    4 epochs peuvent détruire en un batch ce que l'ancre KL reconstruit
++    en 20 (cf. effondrement rl_nooracle_v1 : kl~+0.02 PAR update, 3856
++    updates). 0.015 = standard PPO.
++
++    Retour : dict de métriques ('early_stop' : True si coupé).
+     """
+     B = len(transitions)
+     if B < 2:
+@@ -119,8 +133,11 @@ def ppo_update(agent, transitions, epochs=4, minibatch=512,
+         'pg_norm': [], 'cg_norm': [],
+     }
+     use_kl = kl_coef > 0
++    early_stop = False
+ 
+     for epoch in range(epochs):
++        if early_stop:
++            break
+         perm = np.random.permutation(B)
+         for s in range(0, B, mb):
+             idx = perm[s:s + mb]
+@@ -200,8 +217,15 @@ def ppo_update(agent, transitions, epochs=4, minibatch=512,
+             metrics['pg_norm'].append(float(pg))
+             metrics['cg_norm'].append(float(cg))
+ 
++            # ---- [V2] early-stop KL (garde-fou anti-dérive) ----
++            if target_kl is not None and metrics['approx_kl']:
++                if float(np.mean(metrics['approx_kl'])) > 1.5 * target_kl:
++                    early_stop = True
++                    break
++
+     out = {k: (float(np.mean(v)) if v else None)
+            for k, v in metrics.items()}
+     out['n_grad_steps'] = len(metrics['policy_loss'])
+     out['batch_size'] = B
++    out['early_stop'] = early_stop
+     return out
+diff --git a/mahjong_ai/rl/train.py b/mahjong_ai/rl/train.py
+index 7c35723..f0d2dd0 100644
+--- a/mahjong_ai/rl/train.py
++++ b/mahjong_ai/rl/train.py
+@@ -168,7 +168,7 @@ def train(args):
+         agent, n_envs=args.n_envs, seed=args.seed,
+         grp_path=args.grp_checkpoint,
+         compute_lookahead=args.compute_lookahead,
+-        danger_labels=(args.danger_penalty > 0),
++        danger_labels=(args.danger_penalty > 0 or args.danger_labels),
+         mode=args.mode, device=device,
+     )
+ 
+@@ -199,6 +199,22 @@ def train(args):
+           f"batch_games={args.batch_games} minibatch={args.minibatch} "
+           f"epochs={args.ppo_epochs} kl_coef={args.kl_coef} "
+           f"entropy={args.entropy_mode}", flush=True)
++    if args.adv_mode == 'critic':
++        print(f"[train] [V2] ADV-MODE critic : baseline V(s) asymétrique "
++              f"(critic 283c voit l'oracle complet, policy jamais), "
++              f"warmup={args.critic_warmup_updates} updates, "
++              f"repli batch_mean si EV < {args.min_ev}", flush=True)
++    if args.kl_coef > 0:
++        print(f"[train] [V2] ANCRE KL vers le SL de départ : "
++              f"coef={args.kl_coef} (réf = policy à l'init = SL)",
++              flush=True)
++    if args.target_kl > 0:
++        print(f"[train] [V2] EARLY-STOP KL : cible={args.target_kl} "
++              f"(epochs coupées si KL moyenne > "
++              f"{1.5 * args.target_kl:.4f})", flush=True)
++    if args.danger_labels and args.danger_penalty == 0:
++        print("[train] [V2] DANGER-LABELS : dng% (deal-in potentiel) "
++              "loggé sans pénalité de reward", flush=True)
+     print(f"[train] SANITY ||W_o||={agent.oracle_weight_norm():.4f} "
+           f"(init {agent.oracle_init_norm:.4f})", flush=True)
+ 
+@@ -263,6 +279,7 @@ def train(args):
+             lr_policy=args.lr * phase_lr_mult(phase, args.no_oracle)[0],
+             lr_critic=args.critic_lr * phase_lr_mult(
+                 phase, args.no_oracle)[1],
++            target_kl=(args.target_kl if args.target_kl > 0 else None),
+         )
+         if metrics is None:
+             continue
+@@ -302,6 +319,7 @@ def train(args):
+             ev_str = (f" ev={adv_info['ev']:+.3f}"
+                       f"({'critic' if adv_info['used_critic'] else 'mean'})"
+                       ) if args.adv_mode == 'critic' else ''
++            stop_str = ' KL-STOP' if metrics.get('early_stop') else ''
+             print(f"[step {step:7d} | ph{phase} g={gamma_t:.2f}] "
+                   f"pl={metrics['policy_loss']:+.4f} "
+                   f"vl={metrics['value_loss']:.4f} "
+@@ -309,12 +327,20 @@ def train(args):
+                   f"a={alpha:.4f} "
+                   f"rdev={rdev:.4f} kl~{metrics['approx_kl']:+.4f} "
+                   f"clip={metrics['clip_frac']:.2f} "
+-                  f"pgn={metrics['pg_norm']:.2f}{ev_str} "
++                  f"pgn={metrics['pg_norm']:.2f}{ev_str}{stop_str} "
+                   f"||W_o||={wo:.3f} "
+                   f"({elapsed:.0f}s, {n_games_total} games, "
+                   f"{n_grad_steps} grad-steps)", flush=True)
++            # [V2] accord top-1 vs SL (drift) + variance brute de
++            # l'avantage (ce que la baseline n'a PAS absorbé)
++            agr = agent.sl_agreement(transitions)
++            agr_str = 'n/a' if agr is None else f"{agr:.1%}"
++            if agr is not None and agr < 0.85:
++                agr_str += '!!'
+             print(f"    | DRIFT ret_mean={adv_info['ret_mean']:+.2f} "
+                   f"ret_std={adv_info['ret_std']:.2f} "
++                  f"advvar={adv_info['adv_var_raw']:.1f} "
++                  f"agr={agr_str} "
+                   f"upd={n_updates} collect={t_collect:.0f}s "
+                   f"({len(transitions)} tr)", flush=True)
+             game_line = window.format()
+@@ -450,8 +476,17 @@ def build_parser():
+ 
+     # --- régularisation ---
+     p.add_argument('--kl-coef', type=float, default=0.0,
+-                   help="ancre KL vers --kl-ref (DÉFAUT 0 : une ancre "
+-                        "vers le SL annule l'apprentissage, cf. v10)")
++                   help="ancre KL vers --kl-ref (DÉFAUT 0). [V2] avec la "
++                        "baseline critic, 0.10 est le point de départ "
++                        "recommandé (monter à 0.20 si H grimpe ou agr "
++                        "< 90% avant 100k steps). L'échec v10 (0.05 "
++                        "annulait l'apprentissage) date de l'ancien "
++                        "pipeline off-policy, sans early-stop ni critic.")
++    p.add_argument('--target-kl', type=float, default=0.0,
++                   help="[V2] early-stop PPO : les epochs restantes sont "
++                        "coupées si KL moyenne > 1.5x cible (0 = off ; "
++                        "0.015 recommandé). Limite la dérive PAR update, "
++                        "complémentaire de l'ancre KL (dérive cumulée).")
+     p.add_argument('--entropy-mode',
+                    choices=['off', 'fixed', 'adaptive'], default='off')
+     p.add_argument('--alpha-fixed', type=float, default=0.0)
+@@ -466,6 +501,11 @@ def build_parser():
+     p.add_argument('--danger-penalty', type=float, default=0.0,
+                    help="pénalité sur la défausse d'une tuile qui ferait "
+                         "ron (label exact depuis les mains cachées)")
++    p.add_argument('--danger-labels', action='store_true',
++                   help="[V2] calcule les labels danger (dng% = deal-in "
++                        "potentiel dans les logs GAME) SANS pénalité de "
++                        "reward — instrumentation gratuite, coût CPU "
++                        "marginal")
+     p.add_argument('--no-grp-terminal-correction', action='store_true',
+                    help="désactive la correction terminale "
+                         "(R_vrai - Phi_final) du shaping GRP")
+diff --git a/mahjong_ai/test_rl_rework.py b/mahjong_ai/test_rl_rework.py
+index 17868e3..40e2aa3 100644
+--- a/mahjong_ai/test_rl_rework.py
++++ b/mahjong_ai/test_rl_rework.py
+@@ -239,6 +239,62 @@ def test_7_smoke_train(ckpt_dir):
+     print(f"    OK ({time.time()-t0:.0f}s)")
+ 
+ 
++def test_8_v2_gate0_gate1(ckpt_dir):
++    print("\n=== TEST 8 : [V2] accord SL, critic baseline, early-stop KL ===")
++    agent, runner = make_agent_and_runner(ckpt_dir, n_envs=2)
++    # conditions no-oracle : gamma_t=0 -> oracle masqué partout
++    episodes, _ = runner.collect_batch(2, gamma_t=0.0)
++    transitions = [t for ep in episodes for t in ep]
++    assert len(transitions) >= 16
++
++    # (a) accord top-1 avec le SL à l'init = 1.0 EXACT (canaux oracle
++    # muets : conv sans bias -> contribution nulle des canaux zéros)
++    agr0 = agent.sl_agreement(transitions)
++    print(f"    accord SL à l'init = {agr0:.4f} (attendu 1.0)")
++    assert agr0 is not None and agr0 > 0.999, \
++        f"accord init {agr0} != 1.0 : l'ancre SL est cassée"
++
++    # (b) critic entraîné sur le batch (warmup, policy figée) ->
++    #     Var(G - V) < Var(G) : c'est LE mécanisme Gate 1. Un critic
++    #     non entraîné ferait l'inverse (variance ajoutée), d'où le
++    #     warmup --critic-warmup-updates du trainer.
++    _, info_bm = compute_advantages(agent, transitions, mode='batch_mean')
++    for _ in range(20):
++        compute_advantages(agent, transitions, mode='batch_mean')
++        ppo_update(agent, transitions, epochs=1, minibatch=128, warmup=True)
++    _, info = compute_advantages(agent, transitions, mode='critic',
++                                 min_ev=-1e9)
++    print(f"    adv_var_raw : batch_mean={info_bm['adv_var_raw']:.2f} "
++          f"critic(appris)={info['adv_var_raw']:.2f} "
++          f"(ev={info['ev']:+.3f}, used_critic={info['used_critic']})")
++    assert info['used_critic'], "critic non utilisé (min_ev)"
++    assert info['adv_var_raw'] < info_bm['adv_var_raw'], \
++        "le critic entraîné doit absorber de la variance"
++
++    # (c) early-stop KL : cible minuscule -> l'update coupe avant la fin
++    m_full = ppo_update(agent, transitions, epochs=4, minibatch=128)
++    m_stop = ppo_update(agent, transitions, epochs=4, minibatch=128,
++                        target_kl=1e-8)
++    print(f"    grad-steps : complet={m_full['n_grad_steps']} "
++          f"avec target_kl=1e-8 -> {m_stop['n_grad_steps']} "
++          f"(early_stop={m_stop['early_stop']})")
++    assert m_stop['early_stop'], "l'early-stop KL ne s'est pas déclenché"
++    assert m_stop['n_grad_steps'] < m_full['n_grad_steps'], \
++        "l'early-stop n'a rien économisé"
++    # rétro-compat : sans target_kl, early_stop=False et même budget
++    assert not m_full['early_stop']
++
++    # (d) l'accord descend après des updates agressifs (l'instrument vit)
++    for _ in range(3):
++        compute_advantages(agent, transitions, mode='batch_mean')
++        ppo_update(agent, transitions, epochs=4, minibatch=128)
++    agr1 = agent.sl_agreement(transitions)
++    print(f"    accord SL après 3 updates agressifs = {agr1:.4f} "
++          f"(doit être <= 1.0)")
++    assert 0.0 <= agr1 <= 1.0
++    print("    OK")
++
++
+ def main():
+     tmpdir = tempfile.mkdtemp(prefix='mj_rl_test_')
+     print(f"checkpoints factices : {tmpdir}")
+@@ -251,6 +307,7 @@ def main():
+     test_5_save_resume(tmpdir)
+     test_6_modes(tmpdir)
+     test_7_smoke_train(tmpdir)
++    test_8_v2_gate0_gate1(tmpdir)
+     print(f"\n=== TOUS LES TESTS PASSENT ({time.time()-t0:.0f}s) ===")
+ 
+ 

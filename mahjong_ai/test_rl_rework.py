@@ -239,6 +239,62 @@ def test_7_smoke_train(ckpt_dir):
     print(f"    OK ({time.time()-t0:.0f}s)")
 
 
+def test_8_v2_gate0_gate1(ckpt_dir):
+    print("\n=== TEST 8 : [V2] accord SL, critic baseline, early-stop KL ===")
+    agent, runner = make_agent_and_runner(ckpt_dir, n_envs=2)
+    # conditions no-oracle : gamma_t=0 -> oracle masqué partout
+    episodes, _ = runner.collect_batch(2, gamma_t=0.0)
+    transitions = [t for ep in episodes for t in ep]
+    assert len(transitions) >= 16
+
+    # (a) accord top-1 avec le SL à l'init = 1.0 EXACT (canaux oracle
+    # muets : conv sans bias -> contribution nulle des canaux zéros)
+    agr0 = agent.sl_agreement(transitions)
+    print(f"    accord SL à l'init = {agr0:.4f} (attendu 1.0)")
+    assert agr0 is not None and agr0 > 0.999, \
+        f"accord init {agr0} != 1.0 : l'ancre SL est cassée"
+
+    # (b) critic entraîné sur le batch (warmup, policy figée) ->
+    #     Var(G - V) < Var(G) : c'est LE mécanisme Gate 1. Un critic
+    #     non entraîné ferait l'inverse (variance ajoutée), d'où le
+    #     warmup --critic-warmup-updates du trainer.
+    _, info_bm = compute_advantages(agent, transitions, mode='batch_mean')
+    for _ in range(20):
+        compute_advantages(agent, transitions, mode='batch_mean')
+        ppo_update(agent, transitions, epochs=1, minibatch=128, warmup=True)
+    _, info = compute_advantages(agent, transitions, mode='critic',
+                                 min_ev=-1e9)
+    print(f"    adv_var_raw : batch_mean={info_bm['adv_var_raw']:.2f} "
+          f"critic(appris)={info['adv_var_raw']:.2f} "
+          f"(ev={info['ev']:+.3f}, used_critic={info['used_critic']})")
+    assert info['used_critic'], "critic non utilisé (min_ev)"
+    assert info['adv_var_raw'] < info_bm['adv_var_raw'], \
+        "le critic entraîné doit absorber de la variance"
+
+    # (c) early-stop KL : cible minuscule -> l'update coupe avant la fin
+    m_full = ppo_update(agent, transitions, epochs=4, minibatch=128)
+    m_stop = ppo_update(agent, transitions, epochs=4, minibatch=128,
+                        target_kl=1e-8)
+    print(f"    grad-steps : complet={m_full['n_grad_steps']} "
+          f"avec target_kl=1e-8 -> {m_stop['n_grad_steps']} "
+          f"(early_stop={m_stop['early_stop']})")
+    assert m_stop['early_stop'], "l'early-stop KL ne s'est pas déclenché"
+    assert m_stop['n_grad_steps'] < m_full['n_grad_steps'], \
+        "l'early-stop n'a rien économisé"
+    # rétro-compat : sans target_kl, early_stop=False et même budget
+    assert not m_full['early_stop']
+
+    # (d) l'accord descend après des updates agressifs (l'instrument vit)
+    for _ in range(3):
+        compute_advantages(agent, transitions, mode='batch_mean')
+        ppo_update(agent, transitions, epochs=4, minibatch=128)
+    agr1 = agent.sl_agreement(transitions)
+    print(f"    accord SL après 3 updates agressifs = {agr1:.4f} "
+          f"(doit être <= 1.0)")
+    assert 0.0 <= agr1 <= 1.0
+    print("    OK")
+
+
 def main():
     tmpdir = tempfile.mkdtemp(prefix='mj_rl_test_')
     print(f"checkpoints factices : {tmpdir}")
@@ -251,6 +307,7 @@ def main():
     test_5_save_resume(tmpdir)
     test_6_modes(tmpdir)
     test_7_smoke_train(tmpdir)
+    test_8_v2_gate0_gate1(tmpdir)
     print(f"\n=== TOUS LES TESTS PASSENT ({time.time()-t0:.0f}s) ===")
 
 

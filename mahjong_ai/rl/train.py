@@ -168,7 +168,7 @@ def train(args):
         agent, n_envs=args.n_envs, seed=args.seed,
         grp_path=args.grp_checkpoint,
         compute_lookahead=args.compute_lookahead,
-        danger_labels=(args.danger_penalty > 0),
+        danger_labels=(args.danger_penalty > 0 or args.danger_labels),
         mode=args.mode, device=device,
     )
 
@@ -199,6 +199,22 @@ def train(args):
           f"batch_games={args.batch_games} minibatch={args.minibatch} "
           f"epochs={args.ppo_epochs} kl_coef={args.kl_coef} "
           f"entropy={args.entropy_mode}", flush=True)
+    if args.adv_mode == 'critic':
+        print(f"[train] [V2] ADV-MODE critic : baseline V(s) asymétrique "
+              f"(critic 283c voit l'oracle complet, policy jamais), "
+              f"warmup={args.critic_warmup_updates} updates, "
+              f"repli batch_mean si EV < {args.min_ev}", flush=True)
+    if args.kl_coef > 0:
+        print(f"[train] [V2] ANCRE KL vers le SL de départ : "
+              f"coef={args.kl_coef} (réf = policy à l'init = SL)",
+              flush=True)
+    if args.target_kl > 0:
+        print(f"[train] [V2] EARLY-STOP KL : cible={args.target_kl} "
+              f"(epochs coupées si KL moyenne > "
+              f"{1.5 * args.target_kl:.4f})", flush=True)
+    if args.danger_labels and args.danger_penalty == 0:
+        print("[train] [V2] DANGER-LABELS : dng% (deal-in potentiel) "
+              "loggé sans pénalité de reward", flush=True)
     print(f"[train] SANITY ||W_o||={agent.oracle_weight_norm():.4f} "
           f"(init {agent.oracle_init_norm:.4f})", flush=True)
 
@@ -263,6 +279,7 @@ def train(args):
             lr_policy=args.lr * phase_lr_mult(phase, args.no_oracle)[0],
             lr_critic=args.critic_lr * phase_lr_mult(
                 phase, args.no_oracle)[1],
+            target_kl=(args.target_kl if args.target_kl > 0 else None),
         )
         if metrics is None:
             continue
@@ -302,6 +319,7 @@ def train(args):
             ev_str = (f" ev={adv_info['ev']:+.3f}"
                       f"({'critic' if adv_info['used_critic'] else 'mean'})"
                       ) if args.adv_mode == 'critic' else ''
+            stop_str = ' KL-STOP' if metrics.get('early_stop') else ''
             print(f"[step {step:7d} | ph{phase} g={gamma_t:.2f}] "
                   f"pl={metrics['policy_loss']:+.4f} "
                   f"vl={metrics['value_loss']:.4f} "
@@ -309,12 +327,20 @@ def train(args):
                   f"a={alpha:.4f} "
                   f"rdev={rdev:.4f} kl~{metrics['approx_kl']:+.4f} "
                   f"clip={metrics['clip_frac']:.2f} "
-                  f"pgn={metrics['pg_norm']:.2f}{ev_str} "
+                  f"pgn={metrics['pg_norm']:.2f}{ev_str}{stop_str} "
                   f"||W_o||={wo:.3f} "
                   f"({elapsed:.0f}s, {n_games_total} games, "
                   f"{n_grad_steps} grad-steps)", flush=True)
+            # [V2] accord top-1 vs SL (drift) + variance brute de
+            # l'avantage (ce que la baseline n'a PAS absorbé)
+            agr = agent.sl_agreement(transitions)
+            agr_str = 'n/a' if agr is None else f"{agr:.1%}"
+            if agr is not None and agr < 0.85:
+                agr_str += '!!'
             print(f"    | DRIFT ret_mean={adv_info['ret_mean']:+.2f} "
                   f"ret_std={adv_info['ret_std']:.2f} "
+                  f"advvar={adv_info['adv_var_raw']:.1f} "
+                  f"agr={agr_str} "
                   f"upd={n_updates} collect={t_collect:.0f}s "
                   f"({len(transitions)} tr)", flush=True)
             game_line = window.format()
@@ -450,8 +476,17 @@ def build_parser():
 
     # --- régularisation ---
     p.add_argument('--kl-coef', type=float, default=0.0,
-                   help="ancre KL vers --kl-ref (DÉFAUT 0 : une ancre "
-                        "vers le SL annule l'apprentissage, cf. v10)")
+                   help="ancre KL vers --kl-ref (DÉFAUT 0). [V2] avec la "
+                        "baseline critic, 0.10 est le point de départ "
+                        "recommandé (monter à 0.20 si H grimpe ou agr "
+                        "< 90%% avant 100k steps). L'échec v10 (0.05 "
+                        "annulait l'apprentissage) date de l'ancien "
+                        "pipeline off-policy, sans early-stop ni critic.")
+    p.add_argument('--target-kl', type=float, default=0.0,
+                   help="[V2] early-stop PPO : les epochs restantes sont "
+                        "coupées si KL moyenne > 1.5x cible (0 = off ; "
+                        "0.015 recommandé). Limite la dérive PAR update, "
+                        "complémentaire de l'ancre KL (dérive cumulée).")
     p.add_argument('--entropy-mode',
                    choices=['off', 'fixed', 'adaptive'], default='off')
     p.add_argument('--alpha-fixed', type=float, default=0.0)
@@ -466,6 +501,11 @@ def build_parser():
     p.add_argument('--danger-penalty', type=float, default=0.0,
                    help="pénalité sur la défausse d'une tuile qui ferait "
                         "ron (label exact depuis les mains cachées)")
+    p.add_argument('--danger-labels', action='store_true',
+                   help="[V2] calcule les labels danger (dng%% = deal-in "
+                        "potentiel dans les logs GAME) SANS pénalité de "
+                        "reward — instrumentation gratuite, coût CPU "
+                        "marginal")
     p.add_argument('--no-grp-terminal-correction', action='store_true',
                    help="désactive la correction terminale "
                         "(R_vrai - Phi_final) du shaping GRP")

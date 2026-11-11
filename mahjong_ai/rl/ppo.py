@@ -38,6 +38,12 @@ def compute_advantages(agent, transitions, mode='batch_mean',
     critic non encore entraîné ajoute du bruit au lieu d'en retirer).
 
     Retour (advantages, info) ; pose t['advantage'] sur chaque transition.
+
+    [V2] info contient adv_var_raw : variance de l'avantage AVANT
+    normalisation (unités reward^2). C'est la métrique qui mesure ce que
+    la baseline retire au bruit : batch_mean -> Var(G) ; critic ->
+    Var(G - V(s)). Chute de adv_var_raw = le critic absorbe la variance
+    d'état (hidden info) que la policy ne contrôle pas.
     """
     returns = np.array([t['return'] for t in transitions], dtype=np.float32)
     values = None
@@ -65,13 +71,15 @@ def compute_advantages(agent, transitions, mode='batch_mean',
             advs = resid
             used_critic = True
 
+    adv_var_raw = float(advs.var()) if len(advs) > 1 else 0.0
     if len(advs) > 1 and advs.std() > 1e-6:
         advs = (advs - advs.mean()) / (advs.std() + 1e-8)
     for i, tr in enumerate(transitions):
         tr['advantage'] = float(advs[i])
     info = {'ev': ev, 'used_critic': used_critic,
             'ret_mean': float(returns.mean()),
-            'ret_std': float(returns.std())}
+            'ret_std': float(returns.std()),
+            'adv_var_raw': adv_var_raw}
     return advs, info
 
 
@@ -79,14 +87,20 @@ def ppo_update(agent, transitions, epochs=4, minibatch=512,
                clip_eps=0.2, value_clip=0.2, value_coef=0.5,
                entropy_coef=0.0, kl_coef=0.0, grad_clip=0.5,
                reward_scale=10.0, iw_threshold=None, warmup=False,
-               lr_policy=None, lr_critic=None):
+               lr_policy=None, lr_critic=None, target_kl=None):
     """Une itération PPO complète sur le batch collecté.
 
     warmup=True : seul le critic est optimisé (policy figée) — utilisé au
     démarrage en --adv-mode critic.
     lr_policy/lr_critic : surcharge ponctuelle du LR (phases).
+    target_kl : [V2] early-stop PPO — si la KL moyenne old->new dépasse
+    1.5 x target_kl, les epochs/minibatchs restants sont sautés. Avec la
+    baseline critic le gradient par update est plus fort : sans garde-fou,
+    4 epochs peuvent détruire en un batch ce que l'ancre KL reconstruit
+    en 20 (cf. effondrement rl_nooracle_v1 : kl~+0.02 PAR update, 3856
+    updates). 0.015 = standard PPO.
 
-    Retour : dict de métriques.
+    Retour : dict de métriques ('early_stop' : True si coupé).
     """
     B = len(transitions)
     if B < 2:
@@ -119,8 +133,11 @@ def ppo_update(agent, transitions, epochs=4, minibatch=512,
         'pg_norm': [], 'cg_norm': [],
     }
     use_kl = kl_coef > 0
+    early_stop = False
 
     for epoch in range(epochs):
+        if early_stop:
+            break
         perm = np.random.permutation(B)
         for s in range(0, B, mb):
             idx = perm[s:s + mb]
@@ -200,8 +217,15 @@ def ppo_update(agent, transitions, epochs=4, minibatch=512,
             metrics['pg_norm'].append(float(pg))
             metrics['cg_norm'].append(float(cg))
 
+            # ---- [V2] early-stop KL (garde-fou anti-dérive) ----
+            if target_kl is not None and metrics['approx_kl']:
+                if float(np.mean(metrics['approx_kl'])) > 1.5 * target_kl:
+                    early_stop = True
+                    break
+
     out = {k: (float(np.mean(v)) if v else None)
            for k, v in metrics.items()}
     out['n_grad_steps'] = len(metrics['policy_loss'])
     out['batch_size'] = B
+    out['early_stop'] = early_stop
     return out

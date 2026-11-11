@@ -1,0 +1,22 @@
+diff --git a/mahjong_ai/rl/train.py b/mahjong_ai/rl/train.py
+index f0d2dd0..4e9d312 100644
+--- a/mahjong_ai/rl/train.py
++++ b/mahjong_ai/rl/train.py
+@@ -479,7 +479,7 @@ def build_parser():
+                    help="ancre KL vers --kl-ref (DÉFAUT 0). [V2] avec la "
+                         "baseline critic, 0.10 est le point de départ "
+                         "recommandé (monter à 0.20 si H grimpe ou agr "
+-                        "< 90% avant 100k steps). L'échec v10 (0.05 "
++                        "< 90%% avant 100k steps). L'échec v10 (0.05 "
+                         "annulait l'apprentissage) date de l'ancien "
+                         "pipeline off-policy, sans early-stop ni critic.")
+     p.add_argument('--target-kl', type=float, default=0.0,
+@@ -502,7 +502,7 @@ def build_parser():
+                    help="pénalité sur la défausse d'une tuile qui ferait "
+                         "ron (label exact depuis les mains cachées)")
+     p.add_argument('--danger-labels', action='store_true',
+-                   help="[V2] calcule les labels danger (dng% = deal-in "
++                   help="[V2] calcule les labels danger (dng%% = deal-in "
+                         "potentiel dans les logs GAME) SANS pénalité de "
+                         "reward — instrumentation gratuite, coût CPU "
+                         "marginal")
