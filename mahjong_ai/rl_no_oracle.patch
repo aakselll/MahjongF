@@ -1,0 +1,66 @@
+--- a/mahjong_ai/rl/train.py
++++ b/mahjong_ai/rl/train.py
+@@ -62,6 +62,19 @@
+ PHASE_CRITIC_LR = {1: 1.0, 2: 0.5, 3: 0.1}
+ 
+ 
++def phase_lr_mult(phase, no_oracle=False):
++    """Multiplicateurs (policy, critic) du LR pour la phase.
++
++    [NO-ORACLE] En regime sans oracle, TOUT l'entrainement se fait en
++    conditions de deploiement (gamma=0) : conserver le x0.1 de la
++    phase 3 figerait la policy (cf. run rl_lookahead_v1 : pl~0, clip~0,
++    kl~0 sur 75k steps). On force donc 1.0 partout.
++    """
++    if no_oracle:
++        return 1.0, 1.0
++    return PHASE_POLICY_LR[phase], PHASE_CRITIC_LR[phase]
++
++
+ # ---------------------------------------------------------------------- #
+ # Fenêtre glissante de stats de jeu
+ # ---------------------------------------------------------------------- #
+@@ -178,6 +191,9 @@
+           f"transition={args.transition_frac*100:.0f}% "
+           f"normal={(1-args.oracle_frac-args.transition_frac)*100:.0f}%",
+           flush=True)
++    if args.no_oracle:
++        print("[train] NO-ORACLE : gamma=0 des le step 0, multiplicateurs "
++              "LR forces a 1.0 (policy et critic)", flush=True)
+     print(f"[train] mode={args.mode} n_envs={args.n_envs} "
+           f"batch_games={args.batch_games} minibatch={args.minibatch} "
+           f"epochs={args.ppo_epochs} kl_coef={args.kl_coef} "
+@@ -188,6 +204,8 @@
+     while step < args.total_steps:
+         phase, gamma_t = get_phase_and_gamma(
+             step, args.total_steps, args.oracle_frac, args.transition_frac)
++        if args.no_oracle:
++            gamma_t = 0.0        # [NO-ORACLE] deploiement partout
+         if phase != current_phase:
+             print(f"[step {step:7d}] PHASE {current_phase} -> {phase} "
+                   f"(gamma={gamma_t:.3f})", flush=True)
+@@ -240,8 +258,9 @@
+             iw_threshold=(args.iw_threshold if phase == 3
+                           and args.iw_threshold > 0 else None),
+             warmup=warm,
+-            lr_policy=args.lr * PHASE_POLICY_LR[phase],
+-            lr_critic=args.critic_lr * PHASE_CRITIC_LR[phase],
++            lr_policy=args.lr * phase_lr_mult(phase, args.no_oracle)[0],
++            lr_critic=args.critic_lr * phase_lr_mult(
++                phase, args.no_oracle)[1],
+         )
+         if metrics is None:
+             continue
+@@ -393,6 +412,12 @@
+     p.add_argument('--total-steps', type=int, default=1000000)
+     p.add_argument('--oracle-frac', type=float, default=0.30)
+     p.add_argument('--transition-frac', type=float, default=0.40)
++    p.add_argument('--no-oracle', action='store_true',
++                   help="[NO-ORACLE] coupe l'oracle des le step 0 (gamma=0 "
++                        "partout) ET force les multiplicateurs LR a 1.0 "
++                        "(policy et critic). Les frontieres de phases ne "
++                        "servent plus qu'aux logs. Rend aussi le resume "
++                        "avec un --total-steps plus grand sans danger.")
+     p.add_argument('--oracle-init', choices=['zero', 'kaiming'],
+                    default='kaiming')
+     p.add_argument('--oracle-init-scale', type=float, default=0.25)

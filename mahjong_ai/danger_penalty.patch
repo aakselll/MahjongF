@@ -1,0 +1,354 @@
+From 68a631968e45e5299cdb3d994e6b1482d964e3a9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 31 Oct 2026 20:20:48 +0100
+Subject: [PATCH] RL: penalite de danger (--danger-penalty) : reward shapee via
+ mains cachees, sans toucher au reseau
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01J8SjMHFcdr3YFh7Ebm6sJS
+---
+ envs/multi_agent.py          | 36 +++++++++++++++++--
+ test_danger.py               | 70 ++++++++++++++++++++++++++++++++++++
+ test_danger_penalty.py       | 54 ++++++++++++++++++++++++++++
+ training/self_play_worker.py | 26 +++++++++++---
+ training/train_rl_suphx.py   | 14 ++++++++
+ 5 files changed, 194 insertions(+), 6 deletions(-)
+ create mode 100644 test_danger.py
+ create mode 100644 test_danger_penalty.py
+
+diff --git a/envs/multi_agent.py b/envs/multi_agent.py
+index 54131ba..00f7156 100644
+--- a/envs/multi_agent.py
++++ b/envs/multi_agent.py
+@@ -98,6 +98,11 @@ class MultiAgentMahjongEnv:
+         # Si None, ces tetes yield une request comme avant.
+         # Si dict {'riichi': model, ...}, le modele SL decide directement.
+         self.frozen_sl = frozen_sl_models
++        # [DANGER] si True, les requetes DISCARD contiennent 'danger'
++        # (34 flottants) : 1 si discarder cette tuile donnerait ron a un
++        # adversaire non-furiten tenpai sur cette attente. Label supervise
++        # pour la tete auxiliaire (cout : quelques shanten par requete).
++        self.compute_danger = False
+         self._gen = None
+         self.hands = None
+         self.melds = None
+@@ -884,9 +889,36 @@ class MultiAgentMahjongEnv:
+             r[s] -= EXHAUSTIVE_SHANTEN_COEF * max(sh, 0)
+         return r
+ 
++    def _danger_labels(self, seat):
++        """danger[t] = 1 si un adversaire tenpai (hors furiten) attend t.
++
++        Utilise les mains cachees : sert de cible supervisee dense pour
++        apprendre a predire le danger des tuiles. Ignore le yaku.
++        """
++        danger = np.zeros(N_TILES, dtype=np.float32)
++        for o in self._others(seat):
++            base = self._shanten_counts(o)
++            if int(base.sum()) != 13:
++                continue
++            if shanten_of(base.tolist()) != 0:
++                continue
++            if self._is_furiten(o):
++                continue
++            for t in range(N_TILES):
++                if base[t] >= 4:
++                    continue
++                trial = base.copy()
++                trial[t] += 1
++                if shanten_of(trial.tolist()) == -1:
++                    danger[t] = 1.0
++        return danger
++
+     def _request(self, seat, action_type, obs, mask):
+-        return {"seat": seat, "action_type": action_type, "obs": obs, "mask": mask,
+-                "oracle": self._pending_oracle}
++        req = {"seat": seat, "action_type": action_type, "obs": obs, "mask": mask,
++               "oracle": self._pending_oracle}
++        if self.compute_danger and action_type == DISCARD:
++            req["danger"] = self._danger_labels(seat)
++        return req
+ 
+     @staticmethod
+     def _combine(imm_reward, acting_seat, next_request):
+diff --git a/test_danger.py b/test_danger.py
+new file mode 100644
+index 0000000..a5e4cd0
+--- /dev/null
++++ b/test_danger.py
+@@ -0,0 +1,70 @@
++"""Tests des labels de danger (env, stubs mahjong)."""
++import sys
++import numpy as np
++import test_stubs  # noqa: F401
++from mahjong_ai.envs.multi_agent import MultiAgentMahjongEnv
++
++ok = True
++def check(c, m):
++    global ok
++    print(("  [OK  ] " if c else "  [FAIL] ") + m); ok &= bool(c)
++
++M = lambda *xs: xs
++# main tenpai attente tanki 2z (28) : 123m 456p 789s EEE + S (tanki)
++tenpai = [0,1,2, 12,13,14, 24,25,26, 27,27,27, 28]
++junk   = [0,3,6, 10,13,16, 19,22,25, 29,30,31,32]   # loin du tenpai
++
++def build(hands, river=None, flag=True):
++    env = MultiAgentMahjongEnv(seed=4, compute_lookahead=False)
++    env.compute_danger = flag
++    env.reset_round()
++    for s in range(4):
++        h = np.zeros(34, dtype=np.int32)
++        for t in hands[s]: h[t] += 1
++        env.hands[s] = h
++        env.melds[s] = []
++    env._clear_reds()
++    if river:
++        for s, t in river: env.discards[s][t] += 1
++    return env
++
++env = build([junk + [33], tenpai, junk, junk])           # siege 0 doit defausser
++d = env._danger_labels(0)
++check(d[28] == 1.0 and d.sum() == 1.0, "tenpai tanki 2z : danger uniquement sur la tuile 28")
++# attente multiple : 12m 3 wait 3m (2) ... 1m2m + 3m  -> attente 3m seul (penchan/ryanmen)
++ry = [0,1, 12,13,14, 24,25,26, 27,27,27, 29,29, 30]   # trop long -> ajuster : 13 tuiles
++ry = [0,1, 12,13,14, 24,25,26, 27,27,27, 29,29]       # 13 tuiles : 12m + 456p 789s EEE SS -> attente 3m
++env2 = build([junk + [33], ry, junk, junk])
++d2 = env2._danger_labels(0)
++check(d2[2] == 1.0, "penchan 1-2m : attente 3m (tuile 2) marquee dangereuse")
++# furiten : l'adversaire a deja defausse 28 -> pas de danger
++env3 = build([junk + [33], tenpai, junk, junk], river=[(1, 28)])
++check(env3._danger_labels(0).sum() == 0.0, "adversaire furiten : aucun danger")
++# pas tenpai
++env4 = build([junk + [33], junk, junk, junk])
++check(env4._danger_labels(0).sum() == 0.0, "aucun adversaire tenpai : aucun danger")
++# l'acteur lui-meme est exclu
++env5 = build([tenpai + [33], junk, junk, junk])
++check(env5._danger_labels(0).sum() == 0.0, "la main du siege acteur n'est pas comptee")
++# flag : cle presente dans la requete seulement si actif
++e1 = MultiAgentMahjongEnv(seed=2, compute_lookahead=False); e1.compute_danger = True
++r1 = e1.reset_round()
++e0 = MultiAgentMahjongEnv(seed=2, compute_lookahead=False)
++r0 = e0.reset_round()
++check('danger' in r1 and r1['danger'].shape == (34,), "flag actif : requete DISCARD avec 'danger' (34,)")
++check('danger' not in r0, "flag inactif : pas de cle 'danger' (comportement inchange)")
++# parties aleatoires : jamais d'exception, valeurs binaires
++import random
++n = 0
++for sd in range(30):
++    e = MultiAgentMahjongEnv(seed=100+sd, compute_lookahead=False); e.compute_danger = True
++    req = e.reset_round(); steps = 0
++    while steps < 400:
++        if req['action_type'] == 0:
++            dd = req['danger']; assert set(np.unique(dd)) <= {0.0, 1.0}; n += int(dd.sum() > 0)
++        a = int(np.flatnonzero(req['mask'])[0]) if req['action_type'] == 0 else 0
++        res = e.step(a); steps += 1
++        if res['round_done']: break
++        req = res['next_request']
++check(True, f"30 manches aleatoires sans erreur (requetes avec danger>0 : {n})")
++print("OK" if ok else "ECHEC"); sys.exit(0 if ok else 1)
+diff --git a/test_danger_penalty.py b/test_danger_penalty.py
+new file mode 100644
+index 0000000..6f306ea
+--- /dev/null
++++ b/test_danger_penalty.py
+@@ -0,0 +1,54 @@
++"""Penalite de danger dans le worker (stubs, sans torch reel)."""
++import sys, types
++import numpy as np
++import test_stubs  # noqa: F401
++def _mod(name, **kw):
++    m = types.ModuleType(name); m.__dict__.update(kw); sys.modules[name] = m
++_mod('mahjong_ai.training.game_env', GameEnv=object, PredictorHolder=object)
++_mod('mahjong_ai.agents.oracle_agent', OracleDiscardAgent=object)
++_mod('mahjong_ai.training.parameter_server', fetch_from_state=None)
++_mod('mahjong_ai.agents.reward_predictor', RewardPredictor=object, FEATURE_DIM=12)
++from mahjong_ai.training import self_play_worker as W
++
++ok = True
++def check(c, m):
++    global ok
++    print(("  [OK  ] " if c else "  [FAIL] ") + m); ok &= bool(c)
++
++class FakeEnv:
++    def __init__(self, with_danger):
++        self.game_scores=[0.,0.,0.,0.]; self.honba=0; self.wd=with_danger; self.rd=0
++    def get_stats(self): return {}
++    def reset_round(self):
++        self.n=0; self.rd+=1; return self._req()
++    def _req(self):
++        r = dict(seat=self.n%4, action_type=W.DISCARD, obs=np.zeros(3),
++                 oracle=np.zeros(2), mask=np.ones(34))
++        if self.wd:
++            d = np.zeros(34, dtype=np.float32); d[1] = 1.0   # tuile 1 = dangereuse
++            r['danger'] = d
++        return r
++    def step(self, a):
++        self.n += 1
++        if self.n >= 8:
++            fr = {0:0., 1:0., 2:0., 3:0.}
++            return dict(round_done=True, outcome='exhaustive', final_rewards=fr, game_done=self.rd>=1)
++        return dict(round_done=False, next_request=self._req())
++
++class FakeAgent:
++    def __init__(self, act): self.act=act
++    def select_action(self,o,oo,m,g): return self.act,0.,0.,oo
++
++for act, exp_pen in [(1, True), (2, False)]:
++    tr, st = W._play_one_game(FakeEnv(True), FakeAgent(act), 1.0, danger_penalty=0.7)
++    rew = [t['reward'] for t in tr]
++    if exp_pen:
++        check(all(abs(r + 0.7) < 1e-6 for r in rew), f"action dangereuse : reward = -0.7 sur chaque decision ({rew[:2]}...)")
++        check(st['n_danger_discards'] == st['n_rl_discards'] == len(tr), "compteurs dng = 100 %")
++    else:
++        check(all(r == 0.0 for r in rew), "action sure : pas de penalite")
++        check(st['n_danger_discards'] == 0 and st['n_rl_discards'] == len(tr), "compteurs dng = 0 %")
++# flag inactif : pas de cle 'danger' dans les requetes -> comportement inchange
++tr, st = W._play_one_game(FakeEnv(False), FakeAgent(1), 1.0, danger_penalty=0.0)
++check(all(t['reward'] == 0.0 for t in tr) and st['n_rl_discards'] == 0, "penalite desactivee : comportement inchange")
++print("OK" if ok else "ECHEC"); sys.exit(0 if ok else 1)
+diff --git a/training/self_play_worker.py b/training/self_play_worker.py
+index 524d0cc..7a51855 100644
+--- a/training/self_play_worker.py
++++ b/training/self_play_worker.py
+@@ -40,7 +40,8 @@ def worker_loop(worker_id, state, lock, transitions_queue,
+                 sl_discard_path, sl_frozen_dir,
+                 grp_path=None,
+                 n_games_per_cycle=10, device='cpu',
+-                opponent_sl=False, opponent_mode='argmax'):
++                opponent_sl=False, opponent_mode='argmax',
++                danger_penalty=0.0):
+     """
+     [NIVEAU 2] Les transitions passent par une mp.Queue au lieu d'une
+     liste proxy Manager.
+@@ -58,6 +59,10 @@ def worker_loop(worker_id, state, lock, transitions_queue,
+         opponent_sl        : True -> 1 siege RL (tire au hasard par partie)
+                              + 3 sieges SL figes ; False -> self-play
+         opponent_mode      : 'argmax' | 'sample' pour les SL adversaires
++        danger_penalty     : > 0 -> penalite ajoutee a la reward de chaque
++                             decision du siege RL qui defausse une tuile
++                             'dangereuse' (ferait ron a un adversaire
++                             tenpai, d'apres les mains cachees de l'env)
+     """
+     # [FIX] Limite les threads PyTorch par worker pour eviter
+     # l'oversubscription.
+@@ -95,6 +100,7 @@ def worker_loop(worker_id, state, lock, transitions_queue,
+                   game_log_buffer=None, n_rounds=4,
+                   game_format="tonpuu")
+     env.round_env.frozen_sl = agent.frozen_sl
++    env.round_env.compute_danger = bool(danger_penalty > 0)
+     print(f"[worker {worker_id}] demarre (n_rounds=4, "
+           f"opponent_sl={opponent_sl})", flush=True)
+     seat_rng = np.random.RandomState(1000 + worker_id)
+@@ -118,7 +124,8 @@ def worker_loop(worker_id, state, lock, transitions_queue,
+             agent_player = int(seat_rng.randint(4)) if opponent_sl else None
+             transitions, game_stats = _play_one_game(
+                 env, agent, gamma_t, agent_player=agent_player,
+-                opponent_argmax=(opponent_mode == 'argmax'))
++                opponent_argmax=(opponent_mode == 'argmax'),
++                danger_penalty=danger_penalty)
+             if transitions:
+                 # [NIVEAU 2] put au lieu de buffer_add.
+                 # timeout : ne pas bloquer indefiniment si le trainer est
+@@ -188,11 +195,12 @@ def _update_stats(stats_proxy, lock, game_stats):
+         # non gerees (doivent rester a 0 : sinon une tete SL figee est
+         # cassee).
+         for k in ('n_riichi', 'n_pon', 'n_chi', 'n_kan', 'n_ron_refused',
+-                  'n_sl_errors', 'n_unhandled'):
++                  'n_sl_errors', 'n_unhandled', 'n_rl_discards',
++                  'n_danger_discards'):
+             stats_proxy[k] = stats_proxy.get(k, 0) + game_stats.get(k, 0)
+ 
+ def _play_one_game(env, agent, gamma_t, agent_player=None,
+-                   opponent_argmax=True):
++                   opponent_argmax=True, danger_penalty=0.0):
+     """Joue une partie COMPLETE (4 rounds + repeats).
+ 
+     [FIX MULTI-SEAT REWARD] Le reward de la manche k est attribue a
+@@ -219,6 +227,8 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
+         'n_exhaustive': 0,
+         'n_abortive': 0,
+         'n_unhandled': 0,
++        'n_rl_discards': 0,
++        'n_danger_discards': 0,
+     }
+     # [STATS] snapshot des compteurs cumules de l'env (par process) pour
+     # en deduire les deltas de CETTE partie : riichi, appels, ron refuses.
+@@ -231,6 +241,7 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
+         env_action = None
+         logp = value = 0.0
+         obs_n = obs_o = mask = None
++        danger = None
+ 
+         if req['action_type'] == DISCARD and agent_player is not None \
+                 and seat != agent_player:
+@@ -241,6 +252,7 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
+             obs_n = req['obs']
+             obs_o = req['oracle']
+             mask = req['mask']
++            danger = req.get('danger')
+             action, logp, value, masked_obs_o = agent.select_action(
+                 obs_n, obs_o, mask, gamma_t)
+             env_action = action
+@@ -261,6 +273,12 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
+             # sa prochaine transition plutot que le perdre.
+             carried_reward = pending_reward[seat]
+             pending_reward[seat] = 0.0
++            # [DANGER] penalite par decision : tuile qui ferait ron
++            if danger is not None:
++                stats['n_rl_discards'] += 1
++                if float(danger[action]) > 0:
++                    stats['n_danger_discards'] += 1
++                    carried_reward -= danger_penalty
+             transitions.append({
+                 'seat': seat,
+                 # [FIX MEMOIRE] float16 : ~18 Ko au lieu de ~36 Ko par coup.
+diff --git a/training/train_rl_suphx.py b/training/train_rl_suphx.py
+index 36c7e68..a7341dc 100644
+--- a/training/train_rl_suphx.py
++++ b/training/train_rl_suphx.py
+@@ -87,6 +87,8 @@ STATS_KEYS_INIT = {
+     'n_ron_refused': 0,
+     'n_sl_errors': 0,       # doit rester 0 (tete SL figee en erreur)
+     'n_unhandled': 0,       # doit rester 0 (requete non-DISCARD inattendue)
++    'n_rl_discards': 0,     # [DANGER] decisions du siege RL (si penalite)
++    'n_danger_discards': 0,
+ }
+ 
+ 
+@@ -147,6 +149,10 @@ def format_game_stats(stats_proxy):
+         f"calls/rnd={calls_rnd:.2f} "
+         f"ron_refus/rnd={refused_rnd:.2f}"
+     )
++    n_rl = stats_proxy.get('n_rl_discards', 0)
++    if n_rl:
++        # [DANGER] % de defausses du siege RL qui feraient ron : doit BAISSER
++        line += (f" dng%={100 * stats_proxy.get('n_danger_discards', 0) / n_rl:.2f}")
+     n_err = stats_proxy.get('n_sl_errors', 0)
+     n_unh = stats_proxy.get('n_unhandled', 0)
+     if n_err or n_unh:
+@@ -587,6 +593,7 @@ def train(args):
+                 args.grp_checkpoint,
+                 args.games_per_cycle, device,
+                 args.opponent_sl, args.opponent_mode,
++                args.danger_penalty,
+             ),
+             daemon=True,
+         )
+@@ -1015,6 +1022,13 @@ def main():
+     p.add_argument('--lam', type=float, default=0.95)
+     p.add_argument('--clip-eps', type=float, default=0.2)
+     p.add_argument('--value-coef', type=float, default=0.5)
++    p.add_argument('--danger-penalty', type=float, default=0.0,
++                   help="[DANGER] penalite ajoutee a la reward d'une decision "
++                        "qui defausse une tuile qui ferait ron a un "
++                        "adversaire tenpai (calcule avec les mains cachees "
++                        "de l'env, sans toucher au reseau). 0 = desactive. "
++                        "Conseille 0.5-1.0. Donne un feedback dense qui "
++                        "pousse a utiliser l'oracle puis a deviner le danger.")
+     p.add_argument('--adv-mode', choices=['batch_mean', 'critic'],
+                    default='batch_mean',
+                    help="avantage : 'batch_mean' (A = R - moyenne du batch, "
+-- 
+2.43.0
+

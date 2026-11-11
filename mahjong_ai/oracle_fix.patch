@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 1 Nov 2026 20:00:00 +0100
+Subject: [PATCH] Fix oracle guiding : init Kaiming + freeze tronc phase 1
+
+Probleme : les canaux oracle (ORACLE_DIM derniers canaux de input_conv)
+sont initialises a zero par adapt_in_channels. Un canal a poids nul ne
+recoit aucun gradient utile tant qu'il n'est pas utilise -> le reseau
+n'apprend jamais a s'en servir.
+
+Fix :
+  1. adapt_in_channels accepte init_mode='kaiming' | 'copy' | 'zero'.
+  2. _load_partial_sl passe init_mode='kaiming' -> canaux oracle
+     demarrent aleatoirement au lieu de zero.
+  3. _freeze_trunk_blocks / _unfreeze_trunk_blocks : les blocs
+     residuels sont geles pendant la phase 1 (oracle=1), input_conv
+     reste entrainable pour laisser emerger les canaux oracle.
+  4. train_rl_suphx gelee le tronc au demarrage si on est encore en
+     phase 1, puis le degèle a la transition phase 1 -> phase 2.
+
+Utilisation conseillee (schedule plus genereux) :
+  --oracle-frac 0.30 --transition-frac 0.40
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ agents/oracle_agent.py       | 44 +++++++++++++++++++++++++++++++++--
+ agents/suphx_cnn.py          | 25 ++++++++++++++++---
+ training/train_rl_suphx.py   | 20 +++++++++++++++
+ 3 files changed, 82 insertions(+), 7 deletions(-)
+
+diff --git a/agents/suphx_cnn.py b/agents/suphx_cnn.py
+index aaaaaaa..bbbbbbb 100644
+--- a/agents/suphx_cnn.py
++++ b/agents/suphx_cnn.py
+@@ -19,7 +19,8 @@ N_CHANNELS = 279
+ ORACLE_DIM = 4
+ IN_CHANNELS_ORACLE = N_CHANNELS + ORACLE_DIM  # 283
+ 
+-def adapt_in_channels(w, target_in, dim=1):
++
++def adapt_in_channels(w, target_in, dim=1, init_mode='zero'):
+     """Remet l'axe des canaux d'entree de `w` au layout de `target_in`.
+ 
+     Les canaux presents dans la source mais pas dans la cible sont
+@@ -28,7 +29,17 @@ def adapt_in_channels(w, target_in, dim=1):
+         if has_dst:
+             if piece is None:
+                 shape = list(w.shape)
+                 shape[dim] = size
+-                piece = w.new_zeros(shape)
++                if init_mode == 'zero':
++                    piece = w.new_zeros(shape)
++                elif init_mode == 'kaiming':
++                    piece = torch.empty(shape, dtype=w.dtype,
++                                        device=w.device)
++                    nn.init.kaiming_normal_(piece, nonlinearity='relu')
++                elif init_mode == 'copy':
++                    idx = torch.randint(0, cur, (size,), device=w.device)
++                    piece = w.index_select(dim, idx)
++                else:
++                    raise ValueError(f'init_mode inconnu: {init_mode}')
+             pieces.append(piece)
+     return torch.cat(pieces, dim=dim).contiguous()
+diff --git a/agents/oracle_agent.py b/agents/oracle_agent.py
+index ccccccc..ddddddd 100644
+--- a/agents/oracle_agent.py
++++ b/agents/oracle_agent.py
+@@ -72,7 +72,10 @@ class OracleDiscardAgent:
+             if my_state[k].shape == v.shape:
+                 my_state[k].copy_(v)
+             elif k == 'trunk.input_conv.weight':
+-                new_w = adapt_in_channels(v, my_state[k].shape[1])
++                # [FIX ORACLE] canaux oracle initialises en Kaiming
++                # (au lieu de zeros) pour que le gradient soit non nul.
++                new_w = adapt_in_channels(v, my_state[k].shape[1],
++                                          init_mode='kaiming')
+                 my_state[k].copy_(new_w)
+                 print(f"[oracle_agent] {k} etendu de {v.shape} a {new_w.shape}")
+         self.policy.load_state_dict(my_state)
+@@ -225,6 +228,40 @@ class OracleDiscardAgent:
+         return int(action.item()), logp.item(), value, masked_obs_oracle
+ 
++    # ------------------------------------------------------------------ #
++    def _freeze_trunk_blocks(self):
++        """Gele les blocs residuels + BN d'entree (phase 1).
++
++        input_conv reste entrainable car c'est la que vivent les
++        ORACLE_DIM canaux oracle. Appelee depuis train_rl_suphx quand
++        on demarre en phase 1 (oracle=1).
++        """
++        self._trunk_frozen = True
++        try:
++            for p in self.policy.trunk.blocks.parameters():
++                p.requires_grad = False
++            for p in self.policy.trunk.bn_in.parameters():
++                p.requires_grad = False
++            for p in self.policy.trunk.input_conv.parameters():
++                p.requires_grad = True
++            print('[oracle_agent] tronc residuel gele (phase 1)',
++                  flush=True)
++        except AttributeError as e:
++            print(f'[oracle_agent] WARN freeze tronc : {e} '
++                  f'— verifie les noms trunk.blocks/bn_in/input_conv',
++                  flush=True)
++            self._trunk_frozen = False
++
++    # ------------------------------------------------------------------ #
++    def _unfreeze_trunk_blocks(self):
++        """Degele le tronc. A appeler a la transition phase 1 -> phase 2."""
++        if not getattr(self, '_trunk_frozen', False):
++            return
++        try:
++            for p in self.policy.trunk.blocks.parameters():
++                p.requires_grad = True
++            for p in self.policy.trunk.bn_in.parameters():
++                p.requires_grad = True
++            print('[oracle_agent] tronc residuel degele', flush=True)
++        except AttributeError:
++            pass
++        self._trunk_frozen = False
++
+     # ------------------------------------------------------------------ #
+     def evaluate_actions(self, obs_n, obs_o, masks, actions, gamma_t):
+         """Evalue les log-probs des actions sous la policy courante.
+diff --git a/training/train_rl_suphx.py b/training/train_rl_suphx.py
+index eeeeeee..fffffff 100644
+--- a/training/train_rl_suphx.py
++++ b/training/train_rl_suphx.py
+@@ -540,6 +540,15 @@ def train(args):
+         for w in workers:
+             w.start()
+ 
++    # [FIX ORACLE] transition phase 1 -> phase 2 (oracle=1 -> 0)
++    p1_end = int(args.total_steps * args.oracle_frac)
++    if start_step < p1_end:
++        agent._freeze_trunk_blocks()
++        trunk_unfrozen = False
++    else:
++        trunk_unfrozen = True
++
+     recent_entropies = []
+ 
+     while step < args.total_steps:
+@@ -560,6 +569,13 @@ def train(args):
+         current_phase, gamma_t, _lrf = get_phase_and_gamma(
+             step, args.total_steps, args.oracle_frac, args.transition_frac)
+ 
++        # [FIX ORACLE] degele le tronc en fin de phase 1
++        if (not trunk_unfrozen) and step >= p1_end:
++            agent._unfreeze_trunk_blocks()
++            trunk_unfrozen = True
++            print(f'[oracle] tronc degele a step {step}', flush=True)
++
+         # ... rollout, ppo update, etc. ...
+ 
+         for tr in transitions:
+-- 
+2.43.0

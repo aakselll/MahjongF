@@ -1,0 +1,274 @@
+diff --git a/training/self_play_worker.py b/training/self_play_worker.py
+index 524d0cc..13ff0f5
+--- a/training/self_play_worker.py
++++ b/training/self_play_worker.py
+@@ -191,8 +191,51 @@ def _update_stats(stats_proxy, lock, game_stats):
+                   'n_sl_errors', 'n_unhandled'):
+             stats_proxy[k] = stats_proxy.get(k, 0) + game_stats.get(k, 0)
+ 
++def _finalize_episode_returns(transitions, rho=0.85):
++    """[V9 CRITIC] Retour restant de partie par decision : G_t = somme
++    escomptee (rho^(j-r)) des rewards des manches FUTURES du siege.
++
++    Pourquoi : la cible du critic v8 etait le delta GRP de la MANCHE
++    courante -- une return Monte Carlo determinee par l'issue de la
++    manche (le futur). Probe sur le checkpoint 200k : EV=0.0000,
++    val_std=0.0001, ridge R2=-0.87, critic frais R2_frais=-1.28 ->
++    E[R|s] est plat, le critic degenerait en constante. Le RETOUR
++    RESTANT de partie, lui, est previsible depuis l'etat (own/opp
++    scores en buckets, manche, honba + oracle sont dans les 283
++    canaux ; le GRP lui-meme le prouve sur 12 features grossieres).
++    A = G_t - V(s_t) reste sans biais (V ne depend que de s).
++
++    Groupe les transitions par (siege, manche) consecutives ; R_g =
++    reward de la DERNIERE transition du groupe (le backfill touche tout
++    le groupe a l'identique). Les corrections (carried/pending, qui
++    n'affectent que la 1re/derniere transition) sont restaurees par
++    le terme (t['reward'] - R_g) : chaque transition garde exactement
++    les rewards qui lui ont ete attribues.
++    """
++    groups = {}
++    order = []
++    for i, t in enumerate(transitions):
++        key = (t['seat'], t.get('round', 0))
++        if key not in groups:
++            order.append(key)
++            groups[key] = []
++        groups[key].append(i)
++    suffix = {s: 0.0 for s in set(t['seat'] for t in transitions)}
++    G = {}
++    for key in reversed(order):
++        seat = key[0]
++        idxs = groups[key]
++        R_g = transitions[idxs[-1]]['reward']
++        suffix[seat] = R_g + rho * suffix[seat]
++        for i in idxs:
++            G[i] = suffix[seat] + (transitions[i]['reward'] - R_g)
++    for i, t in enumerate(transitions):
++        t['return'] = float(G[i])
++    return transitions
++
++
+ def _play_one_game(env, agent, gamma_t, agent_player=None,
+-                   opponent_argmax=True):
++                   opponent_argmax=True, return_rho=0.85):
+     """Joue une partie COMPLETE (4 rounds + repeats).
+ 
+     [FIX MULTI-SEAT REWARD] Le reward de la manche k est attribue a
+@@ -202,6 +245,10 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
+     transitions avaient reward=0, diluant le signal d'apprentissage par
+     ~50x.
+ 
++    [V9 CRITIC] Chaque transition porte en plus 'round' (index de
++    manche) et, en fin de partie, 'return' = G_t (retour restant
++    escompte, cible du critic -- voir _finalize_episode_returns).
++
+     [ADVERSAIRES SL] agent_player=None : self-play (4 sieges RL).
+     agent_player=k : seul le joueur k joue avec la policy RL et produit des
+     transitions ; les 3 autres jouent la policy SL figee (sans transition).
+@@ -210,6 +257,8 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
+     pending_reward = {s: 0.0 for s in range(4)}
+     # [FIX] Tous les indices par siege pour la manche courante
+     round_indices_per_seat = {s: [] for s in range(4)}
++    # [V9] Index de manche pose sur chaque transition (pour G_t)
++    round_counter = 0
+     max_honba = 0
+ 
+     stats = {
+@@ -277,6 +326,7 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
+                 'logp': logp,
+                 'value': value,
+                 'reward': carried_reward,
++                'round': round_counter,
+                 'done': False,
+             })
+             # [FIX] Enregistrer TOUTES les transitions du siege
+@@ -293,6 +343,9 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
+             elif outcome.startswith('abortive'):
+                 stats['n_abortive'] += 1
+             stats['n_rounds'] += 1
++            # [V9] La manche est terminee : les transitions suivantes
++            # appartiennent a la manche suivante.
++            round_counter += 1
+ 
+             max_honba = max(max_honba, env.honba)
+ 
+@@ -330,6 +383,8 @@ def _play_one_game(env, agent, gamma_t, agent_player=None,
+ 
+     if transitions:
+         transitions[-1]['done'] = True
++        # [V9 CRITIC] Retour restant de partie (cible du critic)
++        _finalize_episode_returns(transitions, rho=return_rho)
+ 
+     scores = env.game_scores
+     order = sorted(range(4), key=lambda p: (-scores[p], p))
+diff --git a/training/train_rl_suphx.py b/training/train_rl_suphx.py
+index 36c7e68..72d56a4 100644
+--- a/training/train_rl_suphx.py
++++ b/training/train_rl_suphx.py
+@@ -317,22 +317,33 @@ def compute_advantages(transitions, gamma=0.99, lam=0.95, agent=None,
+     adv_mode='batch_mean' (ancien comportement, papier Suphx) :
+         A = R - mean(R_batch)
+     adv_mode='critic' :
+-        A = R - V(s), V = critic asymetrique (voit l'oracle complet),
+-        entraine a predire la reward de la manche (R / reward_scale).
+-        R est la reward GRP de la manche, identique pour toutes les
+-        decisions du siege dans la manche ; avec gamma=1 et fin de manche
+-        terminale, le GAE(lambda=1) se reduit exactement a R - V(s_t) :
+-        c'est la forme sans biais, immunisee contre l'interleaving des
+-        sieges (aucun bootstrap entre transitions).
++        [V9] A = G_t - V(s_t). G_t = retour RESTANT de partie (somme
++        escomptee des rewards des manches futures, cf.
++        _finalize_episode_returns), pose par le worker sur chaque
++        transition. V = critic asymetrique (voit l'oracle complet),
++        entraine a predire G_t / reward_scale.
++
++        Pourquoi le changement de cible : le delta GRP de la MANCHE
++        (cible v8) est determine par l'issue de la manche (le futur)
++        -> E[R|s] plat (probe 200k : EV=0.0000, val_std=0.0001) ->
++        le critic degenerait en constante, aucune reduction de
++        variance. G_t est previsible depuis l'etat (own/opp scores en
++        buckets, manche, honba + oracle sont dans les 283 canaux) ->
++        le critic reduit VRAIMENT la variance, surtout en fin de
++        partie ou le placement se joue. A = G_t - V(s_t) reste sans
++        biais : V ne depend que de s.
+ 
+     Positionne compute_advantages.last_ev / .last_used_critic (logs).
+     """
+-    rewards = np.array([t['reward'] for t in transitions], dtype=np.float32)
++    # [V9] Cible du critic / avantage : retour restant G_t (repli :
++    # reward de manche pour les episodes d'avant le patch)
++    returns = np.array([t.get('return', t['reward']) for t in transitions],
++                       dtype=np.float32)
+ 
+     values = None
+     if adv_mode == 'critic' and agent is not None:
+         values = _critic_values(agent, transitions, reward_scale)
+-    advs, ev, used = advantages_from_values(rewards, values, min_ev)
++    advs, ev, used = advantages_from_values(returns, values, min_ev)
+     compute_advantages.last_ev = ev
+     compute_advantages.last_used_critic = used
+ 
+@@ -342,7 +353,7 @@ def compute_advantages(transitions, gamma=0.99, lam=0.95, agent=None,
+ 
+     for i, tr in enumerate(transitions):
+         tr['advantage'] = advs[i]
+-        tr['return'] = tr['reward']
++        tr['return'] = returns[i]
+ 
+     return advs
+ 
+@@ -399,7 +410,8 @@ def pg_is_loss(agent, transitions, advantages, gamma_t,
+         policy_loss = -(ratio * advs * keep).mean()
+ 
+     if critic_mode:
+-        # cible en unites normalisees (R / reward_scale) : stabilise le MLP
++        # cible en unites normalisees (G_t / reward_scale) : le critic
++        # predit le retour restant de partie, pas le delta de manche
+         value_loss = ((values - returns / reward_scale) ** 2 * keep).mean()
+     else:
+         value_loss = ((values - returns) ** 2 * keep).mean()
+diff --git a/test_v9_returns.py b/test_v9_returns.py
+new file mode 100644
+index 0000000..77adbba
+--- /dev/null
++++ b/test_v9_returns.py
+@@ -0,0 +1,98 @@
++"""Tests du patch v9 : retour restant de partie G_t (cible du critic).
++
++Verifie :
++  1. _finalize_episode_returns : suffixes escomptes par siege, corrections
++     carried/pending, chainage independant par siege, rho=1 telescoping,
++     rho=0 = delta de manche.
++  2. compute_advantages : l'avantage suit 'return' (G_t), pas 'reward' ;
++     repli sur 'reward' pour les episodes d'avant le patch.
++
++Usage : py -3.14 test_v9_returns.py (depuis mahjong_ai/ ou son parent)
++"""
++import os
++import sys
++
++_HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.dirname(_HERE))
++
++import numpy as np
++from mahjong_ai.training.self_play_worker import _finalize_episode_returns
++
++ok = True
++def check(c, m):
++    global ok
++    print(("  [OK  ] " if c else "  [FAIL] ") + m)
++    ok &= bool(c)
++
++
++def T(seat, round_, reward):
++    return {'seat': seat, 'round': round_, 'reward': float(reward)}
++
++
++# --- 1. un siege, 3 manches, pending (+3) sur la derniere transition ---
++tr = [T(0, 0, 1.0), T(0, 0, 1.0),      # manche 0 : R=1 (backfill uniforme)
++      T(0, 1, 0.0),                     # manche 1 : R=0
++      T(0, 2, 2.0), T(0, 2, 5.0)]       # manche 2 : R=2, +3 pending
++_finalize_episode_returns(tr, rho=0.85)
++check(abs(tr[0]['return'] - (1.0 + 0.85 * (0.0 + 0.85 * 5.0))) < 1e-9,
++      f"G manche0 = {tr[0]['return']:.4f} (attendu 4.6125)")
++check(abs(tr[2]['return'] - (0.0 + 0.85 * 5.0)) < 1e-9,
++      f"G manche1 = {tr[2]['return']:.4f} (attendu 4.25)")
++check(abs(tr[3]['return'] - 2.0) < 1e-9,
++      f"G manche2 sans pending = {tr[3]['return']:.4f} (attendu 2.0)")
++check(abs(tr[4]['return'] - 5.0) < 1e-9,
++      f"G manche2 avec pending = {tr[4]['return']:.4f} (attendu 5.0)")
++
++# --- 2. carried : reward reporte sur la 1re transition de la manche +1 ---
++tr = [T(0, 0, 1.0),           # manche 0 : R=1
++      T(0, 1, 2.7)]           # manche 1 : R=2 + carried 0.7
++_finalize_episode_returns(tr, rho=0.85)
++check(abs(tr[1]['return'] - 2.7) < 1e-9,
++      f"carried restaure : G = {tr[1]['return']:.4f} (attendu 2.7)")
++check(abs(tr[0]['return'] - (1.0 + 0.85 * 2.7)) < 1e-9,
++      f"G amont = {tr[0]['return']:.4f} (attendu 3.295)")
++
++# --- 3. deux sieges entrelaces : chainage par siege, pas entre sieges ---
++tr = [T(0, 0, 1.0), T(1, 0, -1.0), T(0, 1, 2.0), T(1, 1, 0.0)]
++_finalize_episode_returns(tr, rho=0.85)
++check(abs(tr[0]['return'] - (1.0 + 0.85 * 2.0)) < 1e-9,
++      f"siege0 manche0 = {tr[0]['return']:.4f} (attendu 2.7)")
++check(abs(tr[1]['return'] - (-1.0 + 0.85 * 0.0)) < 1e-9,
++      f"siege1 manche0 = {tr[1]['return']:.4f} (attendu -1.0)")
++check(abs(tr[3]['return'] - 0.0) < 1e-9,
++      f"siege1 manche1 = {tr[3]['return']:.4f} (attendu 0.0)")
++
++# --- 4. rho=1 : telescopage -> G(1re decision) = somme des deltas ---
++tr = [T(0, 0, 1.0), T(0, 1, 2.0), T(0, 2, 3.0)]
++_finalize_episode_returns(tr, rho=1.0)
++check(abs(tr[0]['return'] - 6.0) < 1e-9,
++      f"rho=1 telescoping : {tr[0]['return']:.4f} (attendu 6.0)")
++
++# --- 5. rho=0 : G = delta de manche (+ corrections) ---
++tr = [T(0, 0, 1.0), T(0, 1, 2.0)]
++_finalize_episode_returns(tr, rho=0.0)
++check(abs(tr[0]['return'] - 1.0) < 1e-9 and abs(tr[1]['return'] - 2.0) < 1e-9,
++      "rho=0 : G = reward de manche")
++
++# --- 6. compute_advantages suit 'return', pas 'reward' (leurre) ---
++from mahjong_ai.training import train_rl_suphx as TR
++
++rng = np.random.RandomState(0)
++G = rng.randn(40).astype(np.float32)
++trans = [{'seat': 0, 'round': i // 10, 'reward': 100.0,   # leurre ignore
++          'return': float(g)} for i, g in enumerate(G)]
++advs = TR.compute_advantages(trans, adv_mode='batch_mean')
++ref = (G - G.mean()) / (G.std() + 1e-8)
++check(np.allclose(advs, ref, atol=1e-5),
++      "A suit G_t ('return'), leurre reward=100 ignore")
++check(all(abs(t['return'] - g) < 1e-6 for t, g in zip(trans, G)),
++      "'return' preservé par compute_advantages")
++
++# --- 7. repli : episodes sans 'return' (avant le patch) -> reward ---
++old = [{'seat': 0, 'round': 0, 'reward': float(g)} for g in G]
++advs2 = TR.compute_advantages(old, adv_mode='batch_mean')
++check(np.allclose(advs2, ref, atol=1e-5),
++      "repli compat : episodes sans 'return' -> reward")
++
++print("OK" if ok else "ECHEC")
++sys.exit(0 if ok else 1)

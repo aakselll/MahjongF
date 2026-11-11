@@ -1,0 +1,26 @@
+diff --git a/envs/multi_agent.py b/envs/multi_agent.py
+index 54131ba..0441f91 100644
+--- a/envs/multi_agent.py
++++ b/envs/multi_agent.py
+@@ -361,8 +361,6 @@ class MultiAgentMahjongEnv:
+                 'indicator': self.red_indicator.copy(),
+                 'pending': pending}
+ 
+-        self._stats["rounds"] += 1
+-
+     def _reveal_kan_dora(self):
+         if self._next_dora_pair_idx < N_DORA_PAIRS:
+             ind, ura = self._dora_pairs[self._next_dora_pair_idx]
+@@ -897,6 +895,12 @@ class MultiAgentMahjongEnv:
+     def _final(self, imm_reward, acting_seat, final_rewards, outcome):
+         if acting_seat is not None:
+             final_rewards[acting_seat] = final_rewards.get(acting_seat, 0.0) + imm_reward
++        # [FIX STATS ROUNDS] L'increment etait en code mort dans _red_state
++        # (place apres le return) : get_stats()["rounds"] restait bloque a 0.
++        # _final est l'unique point de passage de toute fin de manche
++        # (tsumo, ron, multi_ron, chankan, exhaustive, abortives), c'est donc
++        # ici que se compte une manche jouee.
++        self._stats["rounds"] += 1
+         # [FIX BATONS RIICHI] Le cout du baton (-1000 a la declaration) etait
+         # range dans `pending`, ecrase des le discard suivant, donc jamais
+         # preleve : un riichi etait GRATUIT et les batons empoches par le

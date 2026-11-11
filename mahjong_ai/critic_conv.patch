@@ -1,0 +1,89 @@
+diff --git a/agents/oracle_agent.py b/agents/oracle_agent.py
+index 0000000..1111111 100644
+@@ -16,30 +16,72 @@
+ import os
+ from mahjong_ai.agents.suphx_cnn import (
+     build_model, N_CHANNELS, ORACLE_DIM, IN_CHANNELS_ORACLE,
+-    adapt_in_channels, adapt_flat_in_features,
++    adapt_in_channels,
+ )
+ 
+ 
+ class Critic(nn.Module):
+-    def __init__(self, in_channels=IN_CHANNELS_ORACLE, in_tiles=34, hidden=512):
++    """[FIX CRITIC CONV] Ancien critic = MLP sur vecteur aplati
++    (9622 -> 512 -> 256 -> 1) : aucune notion de structure des 34 tuiles,
++    il convergait vers une prediction quasi constante (FLAT_VALUE :
++    val_std ~0.06, EV 1-5 %) et l'avantage A = R - V(s) degenerait en
++    R - moyenne, la meme pathologie que --adv-mode batch_mean.
++
++    Nouveau critic conv, miroir reduit du tronc de la policy : blocs
++    residuels Conv (3,1) comme le SL (pas de normalisation : le critic
++    reste TOUJOURS en mode eval, la BN y serait une operation figee),
++    puis aggregation moyenne+max par canal sur les 34 tuiles et tete
++    lineaire. ~160k parametres (contre ~5M pour l'ancien MLP), cout de
++    forward comparable, bien meilleure hypothese de structure.
++    """
++    def __init__(self, in_channels=IN_CHANNELS_ORACLE, channels=64,
++                 n_blocks=4):
+         super().__init__()
+-        flat = in_channels * in_tiles
+-        self.net = nn.Sequential(
+-            nn.Flatten(),
+-            nn.Linear(flat, hidden), nn.ReLU(),
+-            nn.Linear(hidden, hidden // 2), nn.ReLU(),
+-            nn.Linear(hidden // 2, 1),
++        self.input_conv = nn.Conv2d(in_channels, channels, (3, 1),
++                                    padding=(1, 0), bias=True)
++        self.blocks = nn.ModuleList([
++            nn.Sequential(
++                nn.Conv2d(channels, channels, (3, 1), padding=(1, 0),
++                          bias=True),
++                nn.ReLU(inplace=True),
++                nn.Conv2d(channels, channels, (3, 1), padding=(1, 0),
++                          bias=True),
++            ) for _ in range(n_blocks)
++        ])
++        self.act = nn.ReLU(inplace=True)
++        self.head = nn.Sequential(
++            nn.Linear(2 * channels, channels), nn.ReLU(inplace=True),
++            nn.Linear(channels, 1),
+         )
++        # Tete finale initialisee a zero : V(s) = 0 exactement au depart,
++        # l'ecart de valeur ne peut apparaitre que s'il reduit la loss.
++        nn.init.zeros_(self.head[-1].weight)
++        nn.init.zeros_(self.head[-1].bias)
++
+     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+-        # [ROUGES] ancien critic (272 canaux) -> nouveau (283)
+-        key = prefix + 'net.1.weight'
+-        w = state_dict.get(key)
+-        if w is not None and w.shape[1] != self.net[1].in_features:
+-            state_dict[key] = adapt_flat_in_features(w, self.net[1].in_features)
++        # [COMPAT] Ne charge que les cles du critic conv dont la forme
++        # correspond ; ignore l'ancien critic MLP (net.*) et les anciens
++        # formats de canaux. Un --resume d'un run anterieur fait alors
++        # repartir le critic de son initialisation (apres le warmup il
++        # est redeja bon) au lieu de crasher le load strict.
++        local = self.state_dict()
++        for key in [k for k in state_dict if k.startswith(prefix)]:
++            name = key[len(prefix):]
++            if name not in local or local[name].shape != state_dict[key].shape:
++                del state_dict[key]
++        for name, param in local.items():
++            state_dict.setdefault(prefix + name, param)
+         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+ 
+     def forward(self, x):
+-        return self.net(x).squeeze(-1)
++        if x.dim() == 3:                      # (B, C, 34) -> (B, C, 34, 1)
++            x = x.unsqueeze(-1)
++        h = self.act(self.input_conv(x))
++        for block in self.blocks:
++            h = h + block(h)                  # residuel
++        h = self.act(h).squeeze(-1)           # (B, C, 34)
++        pooled = torch.cat([h.mean(dim=-1), h.max(dim=-1).values], dim=1)
++        return self.head(pooled).squeeze(-1)
+ 
+ 
+ class OracleDiscardAgent:

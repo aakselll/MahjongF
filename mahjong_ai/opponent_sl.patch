@@ -1,0 +1,634 @@
+From 00cdf4c8cc1412f43cc6e99c28e1dad53b9787c6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 27 Oct 2026 23:02:45 +0100
+Subject: [PATCH] RL: option --opponent-sl (1 siege RL aleatoire vs 3 SL figes)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01J8SjMHFcdr3YFh7Ebm6sJS
+---
+ agents/oracle_agent.py       |  23 +++++
+ test_opponent_sl.py          |  56 +++++++++++
+ test_red_fives.py            | 170 +-------------------------------
+ test_stubs.py                | 186 +++++++++++++++++++++++++++++++++++
+ training/self_play_worker.py |  36 +++++--
+ training/train_rl_suphx.py   |  22 ++++-
+ 6 files changed, 316 insertions(+), 177 deletions(-)
+ create mode 100644 test_opponent_sl.py
+ create mode 100644 test_stubs.py
+
+diff --git a/agents/oracle_agent.py b/agents/oracle_agent.py
+index a60cde2..33613b8 100644
+--- a/agents/oracle_agent.py
++++ b/agents/oracle_agent.py
+@@ -226,6 +226,29 @@ class OracleDiscardAgent:
+         
+         return int(action.item()), logp.item(), value, masked_obs_oracle
+ 
++    # ------------------------------------------------------------------ #
++    def select_action_sl(self, obs_normal, mask, argmax=True):
++        """Action de la policy SL GELEE (ref_policy), pour les adversaires.
++
++        Entree = obs normale + canaux oracle a zero (le SL n'a jamais vu
++        l'oracle : ses poids oracle sont a zero). Aucune transition n'est
++        enregistree pour ces sieges.
++        argmax=True : meme protocole que l'eval ; False : echantillonnage.
++        """
++        on = torch.as_tensor(obs_normal, dtype=torch.float32,
++                             device=self.device).unsqueeze(0)
++        mask_t = torch.as_tensor(mask, dtype=torch.float32,
++                                 device=self.device).unsqueeze(0)
++        oo = torch.zeros(1, ORACLE_DIM, dtype=torch.float32,
++                         device=self.device)
++        x = torch.cat([on, oo], dim=1)
++        with torch.no_grad():
++            logits = self.ref_policy(x) + (mask_t - 1.0) * 1e9
++            if argmax:
++                return int(logits.argmax(dim=1).item())
++            return int(torch.distributions.Categorical(
++                logits=logits).sample().item())
++
+     # ------------------------------------------------------------------ #
+     def evaluate_actions(self, obs_n, obs_o, masks, actions, gamma_t):
+         """Evalue les log-probs des actions sous la policy courante.
+diff --git a/test_opponent_sl.py b/test_opponent_sl.py
+new file mode 100644
+index 0000000..20fd558
+--- /dev/null
++++ b/test_opponent_sl.py
+@@ -0,0 +1,56 @@
++"""Test du mode --opponent-sl (stubs, sans torch reel necessaire)."""
++import os, sys, types
++import numpy as np
++import test_stubs  # noqa: F401  (installe les stubs avant mahjong_ai)
++def _mod(name, **kw):
++    m = types.ModuleType(name); m.__dict__.update(kw); sys.modules[name] = m
++_mod('mahjong_ai.training.game_env', GameEnv=object, PredictorHolder=object)
++_mod('mahjong_ai.agents.oracle_agent', OracleDiscardAgent=object)
++_mod('mahjong_ai.training.parameter_server', fetch_from_state=None)
++_mod('mahjong_ai.agents.reward_predictor', RewardPredictor=object, FEATURE_DIM=12)
++from mahjong_ai.training import self_play_worker as W
++
++ok = True
++def check(c, m):
++    global ok
++    print(("  [OK  ] " if c else "  [FAIL] ") + m); ok &= bool(c)
++
++class FakeEnv:
++    """4 sieges, 2 manches de 8 requetes DISCARD tournantes."""
++    def __init__(self): self.game_scores=[0.,0.,0.,0.]; self.honba=0
++    def get_stats(self): return {}
++    def reset_round(self):
++        self.n=0; self.rd=getattr(self,'rd',0)+1
++        return self._req()
++    def _req(self):
++        return dict(seat=self.n%4, action_type=W.DISCARD, obs=np.zeros(3),
++                    oracle=np.zeros(2), mask=np.ones(34))
++    def step(self, a):
++        self.n+=1
++        if self.n>=8:
++            fr={0:5.,1:-5.,2:0.,3:0.}
++            for k,v in fr.items(): self.game_scores[k]+=v
++            return dict(round_done=True, outcome='tsumo', final_rewards=fr,
++                        game_done=self.rd>=2)
++        return dict(round_done=False, next_request=self._req())
++
++class FakeAgent:
++    def __init__(self): self.rl=0; self.sl=0
++    def select_action(self,o,oo,m,g): self.rl+=1; return 1,0.,0.,oo
++    def select_action_sl(self,o,m,argmax=True): self.sl+=1; return 2
++
++seats=[]
++for ap in [None,0,1,2,3]:
++    env=FakeEnv(); ag=FakeAgent()
++    tr,st=W._play_one_game(env,ag,1.0,agent_player=ap)
++    tseats={t['seat'] for t in tr}
++    if ap is None:
++        check(tseats=={0,1,2,3} and ag.sl==0, "self-play inchange : 4 sieges, 0 SL")
++        check(st['rank_of_seat0']==1, "rang = siege 0 en self-play")
++    else:
++        check(tseats=={ap} and ag.sl==12 and ag.rl==4, f"agent={ap}: transitions seulement du siege RL ({ag.rl} RL / {ag.sl} SL)")
++        exp={0:1,1:4}.get(ap,2 if ap==2 else 3)
++        check(st['rank_of_seat0']==exp, f"rang suivi = siege RL ({ap}) -> {st['rank_of_seat0']}")
++rng=np.random.RandomState(1000)
++check(len({int(rng.randint(4)) for _ in range(50)})==4, "tirage du siege couvre les 4 sieges")
++print("OK" if ok else "ECHEC"); sys.exit(0 if ok else 1)
+diff --git a/test_red_fives.py b/test_red_fives.py
+index 65f5d86..86fdec4 100644
+--- a/test_red_fives.py
++++ b/test_red_fives.py
+@@ -44,174 +44,10 @@ def section(title):
+ 
+ 
+ # --------------------------------------------------------------------- #
+-# Stubs
++# Stubs (partages : voir test_stubs.py)
+ # --------------------------------------------------------------------- #
+-def _stub(name, **attrs):
+-    m = types.ModuleType(name)
+-    m.__dict__.update(attrs)
+-    sys.modules[name] = m
+-    return m
+-
+-
+-def _sets_ok(c):
+-    i = 0
+-    while i < 34 and c[i] == 0:
+-        i += 1
+-    if i == 34:
+-        return True
+-    if c[i] >= 3:
+-        c[i] -= 3
+-        r = _sets_ok(c)
+-        c[i] += 3
+-        if r:
+-            return True
+-    if i < 27 and i % 9 <= 6 and c[i + 1] > 0 and c[i + 2] > 0:
+-        c[i] -= 1; c[i + 1] -= 1; c[i + 2] -= 1
+-        r = _sets_ok(c)
+-        c[i] += 1; c[i + 1] += 1; c[i + 2] += 1
+-        return r
+-    return False
+-
+-
+-def _agari(counts, kokushi):
+-    c = [int(x) for x in counts]
+-    if sum(c) % 3 != 2:
+-        return False
+-    for p in range(34):
+-        if c[p] >= 2:
+-            c[p] -= 2
+-            ok = _sets_ok(c)
+-            c[p] += 2
+-            if ok:
+-                return True
+-    if sum(c) == 14 and sum(1 for x in c if x == 2) == 7:
+-        return True
+-    if kokushi:
+-        yao = [0, 8, 9, 17, 18, 26, 27, 28, 29, 30, 31, 32, 33]
+-        if all(c[t] >= 1 for t in yao) and sum(c[t] for t in yao) == 14:
+-            return True
+-    return False
+-
+-
+-@functools.lru_cache(maxsize=500_000)
+-def _shanten_cached(tiles, kokushi):
+-    c = list(tiles)
+-    if _agari(c, kokushi):
+-        return -1
+-    for t in range(34):
+-        if c[t] < 4:
+-            c[t] += 1
+-            ok = _agari(c, kokushi)
+-            c[t] -= 1
+-            if ok:
+-                return 0
+-    return 1
+-
+-
+-class _StubShanten:
+-    def calculate_shanten(self, tiles, use_chiitoitsu=True, use_kokushi=True):
+-        return _shanten_cached(tuple(int(x) for x in tiles), bool(use_kokushi))
+-
+-
+-AKA_IDS = {16, 52, 88}
+-
+-
+-class _StubCalc:
+-    LAST = None          # derniere evaluation : dict(tiles, win_tile, aka)
+-    CALLS = []
+-
+-    @staticmethod
+-    def estimate_hand_value(tiles, win_tile, melds=None,
+-                            dora_indicators=None, ura_dora_indicators=None,
+-                            config=None):
+-        tiles = list(tiles)
+-        assert len(set(tiles)) == len(tiles), f"ids 136 dupliques : {sorted(tiles)}"
+-        assert all(0 <= t < 136 for t in tiles), f"id hors plage : {sorted(tiles)}"
+-        assert win_tile in tiles, f"win_tile {win_tile} absent de {sorted(tiles)}"
+-        use_aka = bool(getattr(config.options, "has_aka_dora", False))
+-        aka = sum(1 for t in tiles if t in AKA_IDS) if use_aka else 0
+-        rec = {"tiles": tiles, "win_tile": win_tile, "aka": aka,
+-               "use_aka": use_aka}
+-        _StubCalc.LAST = rec
+-        _StubCalc.CALLS.append(rec)
+-        han = 1 + aka
+-        total = 1000 * han
+-        return types.SimpleNamespace(
+-            error=None, han=han, fu=30, yaku=[],
+-            cost={"total": total, "main": total // 2, "additional": total // 4,
+-                  "kyoutaku_bonus": 0})
+-
+-
+-def install_stubs():
+-    global REAL_MAHJONG, REAL_TORCH
+-    try:
+-        import mahjong  # noqa: F401
+-        REAL_MAHJONG = True
+-    except Exception:
+-        REAL_MAHJONG = False
+-        _stub("mahjong").__path__ = []
+-        _stub("mahjong.constants", EAST=27, SOUTH=28, WEST=29, NORTH=30)
+-        _stub("mahjong.shanten", Shanten=_StubShanten)
+-        _stub("mahjong.hand_calculating").__path__ = []
+-        _stub("mahjong.hand_calculating.hand", HandCalculator=_StubCalc)
+-
+-        class OptionalRules:
+-            def __init__(self, **kw):
+-                self.has_aka_dora = False
+-                self.__dict__.update(kw)
+-
+-        class HandConfig:
+-            def __init__(self, **kw):
+-                self.options = OptionalRules()
+-                self.__dict__.update(kw)
+-
+-        _stub("mahjong.hand_calculating.hand_config",
+-              HandConfig=HandConfig, OptionalRules=OptionalRules)
+-
+-        class Meld:
+-            CHI, PON, KAN, SHOUMINKAN = "chi", "pon", "kan", "shouminkan"
+-
+-            def __init__(self, meld_type=None, tiles=None, opened=True):
+-                self.type, self.tiles, self.opened = meld_type, tiles, opened
+-
+-        _stub("mahjong.meld", Meld=Meld)
+-    try:
+-        import torch  # noqa: F401
+-        REAL_TORCH = True
+-    except Exception:
+-        REAL_TORCH = False
+-
+-        class _Arr(np.ndarray):
+-            def narrow(self, dim, start, length):
+-                sl = [slice(None)] * self.ndim
+-                sl[dim] = slice(start, start + length)
+-                return np.asarray(self)[tuple(sl)].view(_Arr)
+-
+-            def new_zeros(self, shape):
+-                return np.zeros(shape, dtype=self.dtype).view(_Arr)
+-
+-            def contiguous(self):
+-                return np.ascontiguousarray(self).view(_Arr)
+-
+-        class _Module:
+-            def __init__(self, *a, **k):
+-                pass
+-
+-            def _load_from_state_dict(self, *a, **k):
+-                pass
+-
+-        nn = _stub("torch.nn", Module=_Module, Conv2d=object, BatchNorm2d=object,
+-                   ReLU=object, ModuleList=list, Linear=object, Sequential=object,
+-                   Flatten=object)
+-        _stub("torch", nn=nn, cat=lambda ps, dim=0: np.concatenate(
+-            [np.asarray(p) for p in ps], axis=dim).view(_Arr), _Arr=_Arr)
+-    try:
+-        import zstandard  # noqa: F401
+-    except Exception:
+-        _stub("zstandard")
+-
+-
+-install_stubs()
++import test_stubs                                                         # noqa: E402
++from test_stubs import (REAL_MAHJONG, REAL_TORCH, AKA_IDS, _StubCalc)     # noqa: E402
+ 
+ from mahjong_ai.envs import suphx_features as F                       # noqa: E402
+ from mahjong_ai.envs.suphx_features import (                          # noqa: E402
+diff --git a/test_stubs.py b/test_stubs.py
+new file mode 100644
+index 0000000..cbf8db1
+--- /dev/null
++++ b/test_stubs.py
+@@ -0,0 +1,186 @@
++"""Stubs partages par les tests (mahjong / torch / zstandard).
++
++Importer ce module AVANT mahjong_ai.* : si les vraies libs sont absentes, des
++stubs minimaux sont installes (REAL_MAHJONG / REAL_TORCH disent lesquelles
++sont reelles). Avec les vraies libs, rien n'est remplace.
++"""
++import functools
++import os
++import sys
++import types
++
++import numpy as np
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.dirname(HERE))      # pour `import mahjong_ai`
++
++# --------------------------------------------------------------------- #
++# Stubs
++# --------------------------------------------------------------------- #
++def _stub(name, **attrs):
++    m = types.ModuleType(name)
++    m.__dict__.update(attrs)
++    sys.modules[name] = m
++    return m
++
++
++def _sets_ok(c):
++    i = 0
++    while i < 34 and c[i] == 0:
++        i += 1
++    if i == 34:
++        return True
++    if c[i] >= 3:
++        c[i] -= 3
++        r = _sets_ok(c)
++        c[i] += 3
++        if r:
++            return True
++    if i < 27 and i % 9 <= 6 and c[i + 1] > 0 and c[i + 2] > 0:
++        c[i] -= 1; c[i + 1] -= 1; c[i + 2] -= 1
++        r = _sets_ok(c)
++        c[i] += 1; c[i + 1] += 1; c[i + 2] += 1
++        return r
++    return False
++
++
++def _agari(counts, kokushi):
++    c = [int(x) for x in counts]
++    if sum(c) % 3 != 2:
++        return False
++    for p in range(34):
++        if c[p] >= 2:
++            c[p] -= 2
++            ok = _sets_ok(c)
++            c[p] += 2
++            if ok:
++                return True
++    if sum(c) == 14 and sum(1 for x in c if x == 2) == 7:
++        return True
++    if kokushi:
++        yao = [0, 8, 9, 17, 18, 26, 27, 28, 29, 30, 31, 32, 33]
++        if all(c[t] >= 1 for t in yao) and sum(c[t] for t in yao) == 14:
++            return True
++    return False
++
++
++@functools.lru_cache(maxsize=500_000)
++def _shanten_cached(tiles, kokushi):
++    c = list(tiles)
++    if _agari(c, kokushi):
++        return -1
++    for t in range(34):
++        if c[t] < 4:
++            c[t] += 1
++            ok = _agari(c, kokushi)
++            c[t] -= 1
++            if ok:
++                return 0
++    return 1
++
++
++class _StubShanten:
++    def calculate_shanten(self, tiles, use_chiitoitsu=True, use_kokushi=True):
++        return _shanten_cached(tuple(int(x) for x in tiles), bool(use_kokushi))
++
++
++AKA_IDS = {16, 52, 88}
++
++
++class _StubCalc:
++    LAST = None          # derniere evaluation : dict(tiles, win_tile, aka)
++    CALLS = []
++
++    @staticmethod
++    def estimate_hand_value(tiles, win_tile, melds=None,
++                            dora_indicators=None, ura_dora_indicators=None,
++                            config=None):
++        tiles = list(tiles)
++        assert len(set(tiles)) == len(tiles), f"ids 136 dupliques : {sorted(tiles)}"
++        assert all(0 <= t < 136 for t in tiles), f"id hors plage : {sorted(tiles)}"
++        assert win_tile in tiles, f"win_tile {win_tile} absent de {sorted(tiles)}"
++        use_aka = bool(getattr(config.options, "has_aka_dora", False))
++        aka = sum(1 for t in tiles if t in AKA_IDS) if use_aka else 0
++        rec = {"tiles": tiles, "win_tile": win_tile, "aka": aka,
++               "use_aka": use_aka}
++        _StubCalc.LAST = rec
++        _StubCalc.CALLS.append(rec)
++        han = 1 + aka
++        total = 1000 * han
++        return types.SimpleNamespace(
++            error=None, han=han, fu=30, yaku=[],
++            cost={"total": total, "main": total // 2, "additional": total // 4,
++                  "kyoutaku_bonus": 0})
++
++
++def install_stubs():
++    global REAL_MAHJONG, REAL_TORCH
++    try:
++        import mahjong  # noqa: F401
++        REAL_MAHJONG = True
++    except Exception:
++        REAL_MAHJONG = False
++        _stub("mahjong").__path__ = []
++        _stub("mahjong.constants", EAST=27, SOUTH=28, WEST=29, NORTH=30)
++        _stub("mahjong.shanten", Shanten=_StubShanten)
++        _stub("mahjong.hand_calculating").__path__ = []
++        _stub("mahjong.hand_calculating.hand", HandCalculator=_StubCalc)
++
++        class OptionalRules:
++            def __init__(self, **kw):
++                self.has_aka_dora = False
++                self.__dict__.update(kw)
++
++        class HandConfig:
++            def __init__(self, **kw):
++                self.options = OptionalRules()
++                self.__dict__.update(kw)
++
++        _stub("mahjong.hand_calculating.hand_config",
++              HandConfig=HandConfig, OptionalRules=OptionalRules)
++
++        class Meld:
++            CHI, PON, KAN, SHOUMINKAN = "chi", "pon", "kan", "shouminkan"
++
++            def __init__(self, meld_type=None, tiles=None, opened=True):
++                self.type, self.tiles, self.opened = meld_type, tiles, opened
++
++        _stub("mahjong.meld", Meld=Meld)
++    try:
++        import torch  # noqa: F401
++        REAL_TORCH = True
++    except Exception:
++        REAL_TORCH = False
++
++        class _Arr(np.ndarray):
++            def narrow(self, dim, start, length):
++                sl = [slice(None)] * self.ndim
++                sl[dim] = slice(start, start + length)
++                return np.asarray(self)[tuple(sl)].view(_Arr)
++
++            def new_zeros(self, shape):
++                return np.zeros(shape, dtype=self.dtype).view(_Arr)
++
++            def contiguous(self):
++                return np.ascontiguousarray(self).view(_Arr)
++
++        class _Module:
++            def __init__(self, *a, **k):
++                pass
++
++            def _load_from_state_dict(self, *a, **k):
++                pass
++
++        nn = _stub("torch.nn", Module=_Module, Conv2d=object, BatchNorm2d=object,
++                   ReLU=object, ModuleList=list, Linear=object, Sequential=object,
++                   Flatten=object)
++        _stub("torch", nn=nn, cat=lambda ps, dim=0: np.concatenate(
++            [np.asarray(p) for p in ps], axis=dim).view(_Arr), _Arr=_Arr)
++    try:
++        import zstandard  # noqa: F401
++    except Exception:
++        _stub("zstandard")
++
++
++install_stubs()
++
+diff --git a/training/self_play_worker.py b/training/self_play_worker.py
+index 6c65e69..dd1e583 100644
+--- a/training/self_play_worker.py
++++ b/training/self_play_worker.py
+@@ -39,7 +39,8 @@ def worker_loop(worker_id, state, lock, transitions_queue,
+                 stats_proxy,
+                 sl_discard_path, sl_frozen_dir,
+                 grp_path=None,
+-                n_games_per_cycle=10, device='cpu'):
++                n_games_per_cycle=10, device='cpu',
++                opponent_sl=False, opponent_mode='argmax'):
+     """
+     [NIVEAU 2] Les transitions passent par une mp.Queue au lieu d'une
+     liste proxy Manager.
+@@ -54,6 +55,9 @@ def worker_loop(worker_id, state, lock, transitions_queue,
+         grp_path           : chemin du checkpoint GRP (optionnel)
+         n_games_per_cycle  : parties jouees avant re-sync des poids
+         device             : cpu
++        opponent_sl        : True -> 1 siege RL (tire au hasard par partie)
++                             + 3 sieges SL figes ; False -> self-play
++        opponent_mode      : 'argmax' | 'sample' pour les SL adversaires
+     """
+     # [FIX] Limite les threads PyTorch par worker pour eviter
+     # l'oversubscription.
+@@ -91,7 +95,9 @@ def worker_loop(worker_id, state, lock, transitions_queue,
+                   game_log_buffer=None, n_rounds=4,
+                   game_format="tonpuu")
+     env.round_env.frozen_sl = agent.frozen_sl
+-    print(f"[worker {worker_id}] demarre (n_rounds=4)", flush=True)
++    print(f"[worker {worker_id}] demarre (n_rounds=4, "
++          f"opponent_sl={opponent_sl})", flush=True)
++    seat_rng = np.random.RandomState(1000 + worker_id)
+ 
+     while True:
+         policy_state, critic_state, step, alpha, gamma_t = \
+@@ -106,7 +112,13 @@ def worker_loop(worker_id, state, lock, transitions_queue,
+         agent.set_eval_mode()
+ 
+         for _ in range(n_games_per_cycle):
+-            transitions, game_stats = _play_one_game(env, agent, gamma_t)
++            # [ADVERSAIRES SL] siege RL aleatoire : GameEnv demarre toujours
++            # avec le joueur 0 comme donneur -> tirer le siege RL randomise
++            # aussi le vent de depart / l'ordre de jeu.
++            agent_player = int(seat_rng.randint(4)) if opponent_sl else None
++            transitions, game_stats = _play_one_game(
++                env, agent, gamma_t, agent_player=agent_player,
++                opponent_argmax=(opponent_mode == 'argmax'))
+             if transitions:
+                 # [NIVEAU 2] put au lieu de buffer_add.
+                 # timeout : ne pas bloquer indefiniment si le trainer est
+@@ -179,7 +191,8 @@ def _update_stats(stats_proxy, lock, game_stats):
+                   'n_sl_errors', 'n_unhandled'):
+             stats_proxy[k] = stats_proxy.get(k, 0) + game_stats.get(k, 0)
+ 
+-def _play_one_game(env, agent, gamma_t):
++def _play_one_game(env, agent, gamma_t, agent_player=None,
++                   opponent_argmax=True):
+     """Joue une partie COMPLETE (4 rounds + repeats).
+ 
+     [FIX MULTI-SEAT REWARD] Le reward de la manche k est attribue a
+@@ -188,6 +201,10 @@ def _play_one_game(env, agent, gamma_t):
+     l'assignait qu'a la DERNIERE transition -- 98 pourcent des
+     transitions avaient reward=0, diluant le signal d'apprentissage par
+     ~50x.
++
++    [ADVERSAIRES SL] agent_player=None : self-play (4 sieges RL).
++    agent_player=k : seul le joueur k joue avec la policy RL et produit des
++    transitions ; les 3 autres jouent la policy SL figee (sans transition).
+     """
+     transitions = []
+     pending_reward = {s: 0.0 for s in range(4)}
+@@ -215,7 +232,12 @@ def _play_one_game(env, agent, gamma_t):
+         logp = value = 0.0
+         obs_n = obs_o = mask = None
+ 
+-        if req['action_type'] == DISCARD:
++        if req['action_type'] == DISCARD and agent_player is not None \
++                and seat != agent_player:
++            # Adversaire SL fige : pas de transition enregistree.
++            env_action = agent.select_action_sl(
++                req['obs'], req['mask'], argmax=opponent_argmax)
++        elif req['action_type'] == DISCARD:
+             obs_n = req['obs']
+             obs_o = req['oracle']
+             mask = req['mask']
+@@ -308,7 +330,9 @@ def _play_one_game(env, agent, gamma_t):
+ 
+     scores = env.game_scores
+     order = sorted(range(4), key=lambda p: (-scores[p], p))
+-    rank_of_seat0 = order.index(0) + 1
++    # [ADVERSAIRES SL] rang du siege RL (cle conservee : 'rank_of_seat0')
++    tracked = 0 if agent_player is None else agent_player
++    rank_of_seat0 = order.index(tracked) + 1
+ 
+     stats['rank_of_seat0'] = rank_of_seat0
+     stats['n_honba'] = max_honba
+diff --git a/training/train_rl_suphx.py b/training/train_rl_suphx.py
+index dc923dc..0d75b17 100644
+--- a/training/train_rl_suphx.py
++++ b/training/train_rl_suphx.py
+@@ -130,9 +130,11 @@ def format_game_stats(stats_proxy):
+     line = (
+         f"n={n_games} "
+         f"[{n1}/{n2}/{n3}/{n4}] "
+-        # NB : wr/mean_rank concernent le siege 0 ; les 4 sieges partagent
+-        # la meme policy -> esperance 0.25 / 2.50 par symetrie. Ce n'est
+-        # PAS une mesure de progres (utiliser eval_stable_rank vs SL).
++        # NB : sans --opponent-sl, wr/mean_rank concernent le siege 0 ; les 4
++        # sieges partagent la meme policy -> 0.25 / 2.50 par symetrie, PAS
++        # une mesure de progres. Avec --opponent-sl, ce sont les stats du
++        # siege RL (siege tire au hasard) contre 3 SL : 2.50 = niveau SL,
++        # < 2.50 = le RL progresse (bruit ~ +-0.07 pour 1000 parties).
+         f"wr={win_rate:.3f} "
+         f"mean_rank={mean_rank:.2f} "
+         f"rounds={mean_rounds:.2f} "
+@@ -524,7 +526,8 @@ def train(args):
+                 stats_proxy,
+                 args.sl_discard, args.sl_frozen,
+                 args.grp_checkpoint,
+-                args.games_per_cycle, device
++                args.games_per_cycle, device,
++                args.opponent_sl, args.opponent_mode,
+             ),
+             daemon=True,
+         )
+@@ -939,6 +942,17 @@ def main():
+                    help='[ANCRE] poids de KL(pi || pi_SL) dans la loss. '
+                         '0 = desactive. Plage utile 0.02-0.2 : trop bas -> '
+                         'derive passive ; trop haut -> reste colle au SL.')
++    p.add_argument('--opponent-sl', action='store_true',
++                   help='[ADVERSAIRES SL] 1 siege = policy RL (entrainee), '
++                        '3 sieges = policy SL figee. Le siege RL est tire '
++                        'au hasard a chaque partie (donc vent de depart '
++                        'et ordre de jeu randomises). Seul le siege RL '
++                        'produit des transitions. Defaut : self-play 4 '
++                        'sieges RL.')
++    p.add_argument('--opponent-mode', choices=['argmax', 'sample'],
++                   default='argmax',
++                   help='comportement des SL adversaires : argmax (comme '
++                        "l'eval, defaut) ou sample (plus de diversite).")
+     p.add_argument('--milestone-every', type=int, default=1000000,
+                    help='un checkpoint *_milestoneN.pt jamais purge tous '
+                         'les N steps (0 = desactive)')
+-- 
+2.43.0
+

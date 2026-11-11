@@ -1,0 +1,201 @@
+--- a/envs/multi_agent.py
++++ b/envs/multi_agent.py
+@@ -45,7 +45,6 @@
+ ROUND_WIND = EAST
+ 
+ STEP_PENALTY = 0.0
+-EXHAUSTIVE_SHANTEN_COEF = 0.1
+ REWARD_SCALE = 1.0 / 1000.0
+ RIICHI_STICK_COST = 1000.0
+ NOTEN_PAYMENT_POOL = 3000.0
+@@ -883,9 +882,11 @@
+                 r[s] += gain_each * REWARD_SCALE
+             for s in noten:
+                 r[s] -= loss_each * REWARD_SCALE
+-        for s in range(4):
+-            sh = shanten_of(self._shanten_counts(s).tolist())
+-            r[s] -= EXHAUSTIVE_SHANTEN_COEF * max(sh, 0)
++        # [RETRAIT SHAPING 2026-11] l'ancien terme -0.1*shanten par joueur
++        # (EXHAUSTIVE_SHANTEN_COEF) a ete supprime : paiements de noten
++        # exacts, game_scores conservatifs (somme nulle), plus de derive
++        # sur les seuils 30k/tobi/rangs. Voir remove_exhaustive_shanten_
++        # penalty.patch.
+         return r
+ 
+     def _danger_labels(self, seat):
+--- a/training/game_env.py
++++ b/training/game_env.py
+@@ -65,11 +65,25 @@
+         rewards[player] = RANK_REWARDS[rank]
+     return rewards
+ 
+-def _decide_dealer_repeat(outcome, dealer_round_reward):
++def _decide_dealer_repeat(outcome, dealer_round_reward, dealer_tenpai=None):
++    """Renchan du dealer selon l'issue de manche.
++
++    [FIX RENCHAN EXHAUSTIVE 2026-11] a l'exhaustive, le renchan se décide
++    sur le tenpai REEL du dealer (règle MJSoul 流局连场), pas sur le signe
++    du paiement : quand personne n'est tenpai (paiement 0), l'ancien proxy
++    `paiement >= 0` donnait renchan à tort. Ce bug était masqué par
++    l'artefact -0.1*shanten (paiement alors toujours < 0 si noten) ; son
++    retrait l'a exposé (renchans infinis -> cap MAX_KYOKU en jeu aléatoire,
++    cf. test_enchousen_live). dealer_tenpai=None -> repli sur le proxy
++    (compatibilité anciens appels).
++    """
+     if outcome.startswith("abortive"):
+         return True, False
+     if outcome == "exhaustive":
+-        repeats = dealer_round_reward >= 0
++        if dealer_tenpai is None:
++            repeats = dealer_round_reward >= 0
++        else:
++            repeats = bool(dealer_tenpai)
+         return repeats, repeats
+     repeats = dealer_round_reward > 0
+     return repeats, repeats
+@@ -270,8 +284,18 @@
+         # riichi serait a -1.0 (< 0) et perdrait son renchan a tort.
+         dealer_round_reward = (real_round_rewards[dealer_real]
+                                + self.round_env.stick_paid[0])
++        # [FIX RENCHAN EXHAUSTIVE 2026-11] tenpai REEL du dealer a
++        # l'exhaustive (cf. _decide_dealer_repeat) : le proxy signe du
++        # paiement donnait renchan a tort quand personne n'etait tenpai.
++        dealer_tenpai = None
++        if outcome == "exhaustive":
++            try:
++                dealer_tenpai = shanten_of(
++                    self.round_env._shanten_counts(0).tolist()) == 0
++            except Exception:
++                dealer_tenpai = None   # repli : proxy paiement
+         dealer_repeats, honba_increments = _decide_dealer_repeat(
+-            outcome, dealer_round_reward)
++            outcome, dealer_round_reward, dealer_tenpai)
+ 
+         # [FIX BATONS RIICHI] report des batons : empoches par un gagnant,
+         # sinon ils restent sur la table pour la manche suivante.
+--- a/test_riichi_sticks.py
++++ b/test_riichi_sticks.py
+@@ -11,7 +11,6 @@
+ """
+ import numpy as np
+ 
+-import mahjong_ai.envs.multi_agent as ma
+ from mahjong_ai.envs.multi_agent import (
+     MultiAgentMahjongEnv, DISCARD, RIICHI, RIICHI_YES,
+ )
+@@ -75,7 +74,8 @@
+ 
+ def test_riichi_survives_to_exhaustive():
+     print("\n=== B1 : dealer en riichi -> exhaustive : le baton est preleve ===")
+-    ma.EXHAUSTIVE_SHANTEN_COEF = 0.0           # somme exacte, sans shaping
++    # [RETRAIT SHAPING 2026-11] plus besoin de neutraliser
++    # EXHAUSTIVE_SHANTEN_COEF : les paiements de noten sont exacts par defaut.
+     # pioches (de la fin) : dealer 33, puis honneurs ; jamais 33 ensuite
+     wall = [28, 28, 28, 28, 27, 29, 30, 33]
+     env = make_env([TENPAI, JUNK, JUNK, JUNK], wall)
+--- a/test_end_rules.py
++++ b/test_end_rules.py
+@@ -15,7 +15,7 @@
+ 
+ from mahjong_ai.training.game_env import (
+     GameEnv, N_ROUNDS_NORMAL, N_ROUNDS_MAX, MAX_KYOKU,
+-    TARGET_SCORE, TOBI_THRESHOLD, RANK_REWARDS,
++    TARGET_SCORE, TOBI_THRESHOLD, RANK_REWARDS, _decide_dealer_repeat,
+ )
+ 
+ 
+@@ -312,6 +312,47 @@
+ 
+ 
+ # ====================================================================== #
++# 9. RENCHAN A L'EXHAUSTIVE (regression fix 2026-11)
++# ====================================================================== #
++def test_renchan_exhaustive():
++    section("9. RENCHAN EXHAUSTIVE (tenpai REEL du dealer, pas le paiement)")
++
++    # [FIX RENCHAN EXHAUSTIVE 2026-11] a l'exhaustive sans aucun tenpai,
++    # le paiement vaut 0 : l'ancien proxy 'paiement >= 0' donnait renchan
++    # a tort (le dealer est noten !). Ce bug etait masque par l'artefact
++    # -0.1*shanten (paiement alors < 0) ; son retrait l'a expose :
++    # renchans infinis jusqu'au cap MAX_KYOKU en jeu aleatoire.
++    def check9(name, outcome, reward, want, tenpai=None, use_tenpai=True):
++        if use_tenpai:
++            got = _decide_dealer_repeat(outcome, reward, tenpai)
++        else:
++            got = _decide_dealer_repeat(outcome, reward)
++        ok = (got == want)
++        _results["pass" if ok else "fail"] += 1
++        print(f"  [{'OK' if ok else 'XX'}] {name:55s}"
++              f" -> {got} (attendu {want})")
++
++    check9("exhaustive, 0 tenpai (paiement 0, dealer noten) : PAS renchan",
++           "exhaustive", 0.0, (False, False), tenpai=False)
++    check9("exhaustive, 4 tenpai (paiement 0, dealer tenpai) : renchan",
++           "exhaustive", 0.0, (True, True), tenpai=True)
++    check9("exhaustive, dealer tenpai (+3.0) : renchan + honba",
++           "exhaustive", 3.0, (True, True), tenpai=True)
++    check9("exhaustive, dealer noten (-1.0) : PAS renchan",
++           "exhaustive", -1.0, (False, False), tenpai=False)
++    check9("exhaustive, dealer tenpai en riichi (net 0) : renchan",
++           "exhaustive", 0.0, (True, True), tenpai=True)
++    check9("abortive : renchan SANS honba (inchange)",
++           "abortive_suucha", 0.0, (True, False), use_tenpai=False)
++    check9("tsumo gagnant : renchan", "tsumo", 2.0, (True, True),
++           use_tenpai=False)
++    check9("tsumo perdant : PAS renchan", "tsumo", -2.0, (False, False),
++           use_tenpai=False)
++    check9("exhaustive sans info tenpai (repli proxy, compat) : renchan",
++           "exhaustive", 0.0, (True, True), use_tenpai=False)
++
++
++# ====================================================================== #
+ # Main
+ # ====================================================================== #
+ def main():
+@@ -333,6 +374,7 @@
+     test_enchousen_max()
+     test_max_kyoku()
+     test_priorites()
++    test_renchan_exhaustive()
+ 
+     print(f"\n{'=' * 75}")
+     print(f"  RESULTAT : {_results['pass']} pass / {_results['fail']} fail")
+--- a/ANALYSE_RL.md
++++ b/ANALYSE_RL.md
+@@ -333,12 +333,30 @@
+   « 加时赛中一旦有玩家超过30000点即立刻结束游戏 ». Le check couvre
+   désormais tsumo/ron/multi_ron/exhaustive (les manches abortives ne
+   changent aucun score).
+-  [CAVEAT fidélité] `_noten_payment_rewards` ajoute aux scores un
+-  artefact d'entraînement −0,1×shanten par joueur sur ryuukyoku (jusqu'à
+-  ~0,4/manche) : les `game_scores` de l'env dérivent légèrement des
+-  points MJSoul (30k franchi un peu plus tard, quasi-égalités de rang
+-  possibles). Laissé tel quel volontairement (shaping utilisé par le
+-  pipeline actif) ; à retirer si fidélité stricte voulue.
++  [RETRAIT SHAPING 2026-11] L'artefact d'entraînement −0,1×shanten par
++  joueur sur ryuukyoku (`EXHAUSTIVE_SHANTEN_COEF`, jusqu'à ~0,4/manche)
++  a été **supprimé** de `_noten_payment_rewards` : paiements de noten
++  exacts (pool 3000 réparti tenpai/noten, rien si 0 ou 4 tenpai),
++  `game_scores` conservatifs (somme nulle) — plus de dérive sur les
++  seuils 30k/tobi/rangs ni de quasi-égalités de rang. Motifs : le terme
++  taxait le fold (défense) de 100 pts fantômes par tuile d'écart au
++  tenpai, signal redondant avec le paiement noten réel, et cassait la
++  conservation de l'argent.
++  **Bug démasqué par le retrait** (corrigé dans le même patch) : à
++  l'exhaustive sans aucun tenpai, le paiement vaut 0 et le proxy
++  `paiement >= 0` de `_decide_dealer_repeat` donnait renchan à tort
++  (règle : dealer noten ⇒ le vent avance). L'artefact rendait le
++  paiement strictement négatif et masquait le cas ; sans lui, 85 % des
++  parties aléatoires bouclaient en renchans jusqu'au cap MAX_KYOKU
++  (reproduit par `test_enchousen_live` : 51/60 fins max_kyoku).
++  Le renchan à l'exhaustive se décide désormais sur le **tenpai réel**
++  du dealer (`shanten_of(_shanten_counts(0)) == 0`), identique au
++  comportement d'avant-retrait dans tous les cas où le proxy était
++  correct. Patch : `remove_exhaustive_shanten_penalty.patch`
++  (test_riichi_sticks sans neutralisation 13/13 ; test_end_rules
++  section 9 : 9 nouveaux checks renchan ; test_enchousen_live 13/13 ;
++  test_env_rules 68/68). Attention : changement d'échelle de reward →
++  appliquer en début de run, pas en cours d'entraînement.
+ - `test_v9_returns.py` importe `mahjong_ai.training.self_play_worker`
+   (déplacé en `training/legacy/`) : cassé en amont, sans lien avec le
+   rework.

@@ -1,0 +1,145 @@
+--- a/mahjong_ai/training/train_rl_suphx.py
++++ b/mahjong_ai/training/train_rl_suphx.py
+@@ -431,7 +431,30 @@
+ # ---------------------------------------------------------------------- #
+ # Boucle principale
+ # ---------------------------------------------------------------------- #
++def apply_phase1_guards(args):
++    """[PHASE 1 GUARD] protege un run oracle-complet de l'erreur v10/v11.
++
++    ref_policy (l'ancre KL) est une copie du SL de depart : ses canaux
++    oracle sont ceux de --oracle-init (zero = totalement aveugle). En
++    phase 1 (--oracle-frac 1.0) la policy DOIT s'ecarter du SL
++    precisement la ou l'oracle revele un danger que le SL ne voit pas ->
++    toute valeur kl_coef > 0 punit cet ecart et referme le pathway par
++    les gradients (v10 : ||W_o|| 4.0 -> 0.18 avec kl=0.05 ; v11 lance
++    avec 0.10, soit 2x plus vite encore). On force kl_coef=0, sauf
++    opt-out explicite --allow-phase1-kl.
++    """
++    if (args.oracle_frac >= 1.0 and args.kl_coef > 0
++            and not getattr(args, 'allow_phase1_kl', False)):
++        print(f"[GUARD PHASE 1] --oracle-frac {args.oracle_frac:.2f} avec "
++              f"--kl-coef {args.kl_coef} : l'ancre KL est le SL de depart, "
++              f"aveugle a l'oracle -> effondrement ||W_o|| assure (cf. v10 "
++              f"4.0 -> 0.18). kl_coef force a 0.0 (--allow-phase1-kl pour "
++              f"conserver la valeur).", flush=True)
++        args.kl_coef = 0.0
++
++
+ def train(args):
++    apply_phase1_guards(args)   # [PHASE 1 GUARD] avant tout le reste
+     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+     if device == 'cuda':
+         print(f"[train_rl] GPU detected : {torch.cuda.get_device_name(0)}")
+@@ -575,6 +598,14 @@
+ 
+             print(f"[train_rl]   -> step={start_step}, alpha={start_alpha:.4f}",
+                   flush=True)
++            # [PHASES] enchainer les phases proprement : un milestone de
++            # fin de phase 1 porte un step eleve qui fausserait le
++            # schedule gamma/lr de la phase suivante (gamma deja parti a
++            # 0.x). --reset-step garde les poids, repart a step=0.
++            if args.reset_step:
++                print(f"[train_rl]   --reset-step : step {start_step} -> 0 "
++                      f"(schedule de phase repart du debut)", flush=True)
++                start_step = 0
+             # [FIX ORACLE TAKEOFF] la reference ||W_o|| apres resume est
+             # celle des poids RECHARgES (pas celle de l'init kaiming).
+             agent.oracle_init_norm = agent.oracle_weight_norm()
+@@ -583,6 +614,16 @@
+         except Exception as e:
+             print(f"[train_rl] ECHEC resume : {e}", flush=True)
+ 
++    # [ANCRE KL phase 2/3] --kl-ref : charge la reference KL depuis un
++    # checkpoint (la policy de phase 1, oracle-aware) au lieu du SL de
++    # depart, aveugle a l'oracle. Inutilise en phase 1 (kl_coef=0) mais
++    # decisif en phase 2/3 : sans lui, la penalite KL re-importe la
++    # pression anti-oracle du SL qui a fait chuter ||W_o|| en v10.
++    if args.kl_ref:
++        ref_ck = torch.load(args.kl_ref, map_location=device,
++                            weights_only=False)
++        agent.load_kl_ref(ref_ck['policy'])
++
+     # [FIX BATCHNORM] Policy en eval : stats BN du SL figees, identiques
+     # entre rollout (batch 1) et update (batch ~1000).
+     agent.set_eval_mode()
+@@ -594,6 +635,16 @@
+               "Repartir du SL (sans --resume) pour un test propre.",
+               flush=True)
+ 
++    # [SANITY t=0] banniere de controle : tout ce qui doit etre vrai au
++    # demarrage d'un run de phase 1 (oracle complet) depuis le warmup.
++    print(f"[SANITY t=0] oracle_frac={args.oracle_frac:.2f} "
++          f"transition_frac={args.transition_frac:.2f} "
++          f"kl_coef={args.kl_coef} alpha={start_alpha:.4f} "
++          f"alpha_max={args.alpha_max} h_target={args.h_target}", flush=True)
++    print(f"[SANITY t=0] ||W_o||={agent.oracle_init_norm:.4f} "
++          f"(attendu : warmup ~13.57, SL+kaimingx0.25 ~4.0, zero ~0.0) "
++          f"resume={args.resume} kl_ref={args.kl_ref}", flush=True)
++
+     # --- Publish initial ---
+     publish_to_state(
+         ps.state, ps.lock,
+@@ -1167,7 +1218,19 @@
+     p.add_argument('--kl-coef', type=float, default=0.05,
+                    help='[ANCRE] poids de KL(pi || pi_SL) dans la loss. '
+                         '0 = desactive. Plage utile 0.02-0.2 : trop bas -> '
+-                        'derive passive ; trop haut -> reste colle au SL.')
++                        'derive passive ; trop haut -> reste colle au SL. '
++                        '[PHASE 1 GUARD] force a 0 si --oracle-frac >= 1.0 '
++                        '(cf. apply_phase1_guards).')
++    p.add_argument('--allow-phase1-kl', action='store_true',
++                   help='[PHASE 1 GUARD] conserver --kl-coef tel quel meme '
++                        'si --oracle-frac >= 1.0 (deconseille : ancre SL '
++                        'aveugle a l oracle -> effondrement ||W_o||, cf. v10)')
++    p.add_argument('--kl-ref', type=str, default=None,
++                   help='[ANCRE] checkpoint dont les poids chargent la '
++                        'reference KL (defaut : SL de depart, aveugle a '
++                        'l oracle). Phase 2/3 : pointer le meilleur '
++                        'checkpoint de phase 1 pour ancrer une policy '
++                        'oracle-AWARE.')
+     p.add_argument('--opponent-sl', action='store_true',
+                    help='[ADVERSAIRES SL] 1 siege = policy RL (entrainee), '
+                         '3 sieges = policy SL figee. Le siege RL est tire '
+@@ -1194,7 +1257,14 @@
+ 
+     p.add_argument('--alpha-resume', type=float, default=None,
+                    help='alpha au resume ; prioritaire sur le checkpoint '
+-                        '(defaut: alpha du checkpoint, sinon --alpha-init)')
++                        '(defaut: alpha du checkpoint, sinon --alpha-init). '
++                        'OBLIGATOIRE pour ecraser l alpha du checkpoint '
++                        'warmup (0.0022) : --alpha-resume 0.05.')
++    p.add_argument('--reset-step', action='store_true',
++                   help='[PHASES] reprend les POIDS du --resume mais repart '
++                        'a step=0 : un milestone de fin de phase 1 porte un '
++                        'step eleve qui fausserait le schedule gamma/lr de '
++                        'la phase suivante.')
+ 
+     args = p.parse_args()
+     train(args)
+--- a/mahjong_ai/agents/oracle_agent.py
++++ b/mahjong_ai/agents/oracle_agent.py
+@@ -189,6 +189,23 @@
+         self.policy.eval()
+         self.critic.eval()
+ 
++    def load_kl_ref(self, state_dict):
++        """[ANCRE KL] recharge la reference KL depuis un checkpoint.
++
++        Par defaut ref_policy = copie du SL de depart (ses canaux oracle
++        sont ceux de --oracle-init : zero = aveugle a l'oracle). En
++        phase 2/3, ancrer plutot la policy de phase 1 (oracle-aware) via
++        --kl-ref : sinon la penalite KL re-importe la pression
++        anti-oracle du SL qui a fait chuter ||W_o|| en v10.
++        """
++        self.ref_policy.load_state_dict(state_dict)
++        self.ref_policy.eval()
++        with torch.no_grad():
++            wo = self.ref_policy.trunk.input_conv.weight[
++                :, N_CHANNELS:, :, :].norm().item()
++        print(f"[oracle_agent] ancre KL rechargee : ||W_o||_ref={wo:.4f} "
++              f"(0.0 = ancre aveugle a l'oracle)", flush=True)
++
+     def oracle_weight_norm(self):
+         """Norme L2 des poids input_conv des ORACLE_DIM canaux oracle.
+         Indicateur d'usage de l'info cachee : reste a la valeur d'init si

@@ -1,0 +1,44 @@
+diff --git a/envs/suphx_features.py b/envs/suphx_features.py
+index 6771323..3fa5425 100644
+--- a/envs/suphx_features.py
++++ b/envs/suphx_features.py
+@@ -451,7 +451,9 @@ def build_suphx_obs(*, hands, melds, discards, discard_hist,
+         for m in melds[s]:
+             for t in m['tiles']:
+                 seen[t] += 1
+-    seen += discards[s]
++        # [FIX UNSEEN] etait HORS de la boucle : seules les defausses du
++        # siege 3 etaient comptees (s valait 3 apres la boucle).
++        seen += discards[s]
+     for ind in dora_indicators:
+         if 0 <= ind < N_TILES:
+             seen[ind] += 1
+diff --git a/test_red_fives.py b/test_red_fives.py
+index 445b0cf..65f5d86 100644
+--- a/test_red_fives.py
++++ b/test_red_fives.py
+@@ -723,6 +723,24 @@ if P is not None:
+     st.river_all[0][22] = 1                            # defausse, discards[0][22] == 0
+     check("parser SL : meme regle (_pov_furiten)", P._pov_furiten(st, 0))
+ 
++# ===================================================================== #
++# F. canal 'unseen' : defausses de TOUS les sieges
++# ===================================================================== #
++section("F. canal unseen")
++def unseen_obs(disc_seat):
++    hands = [np.zeros(34, dtype=np.int32) for _ in range(4)]
++    discards = [np.zeros(34, dtype=np.int32) for _ in range(4)]
++    discards[disc_seat][27] = 2          # deux Est defausses par ce siege
++    return build_suphx_obs(
++        hands=hands, melds=[[] for _ in range(4)], discards=discards,
++        discard_hist=[[] for _ in range(4)], riichi_flags=[False] * 4,
++        furiten_flag=False, dora_indicators=[], wall_remaining=70,
++        scores=[0] * 4, dealer_seat=0, round_wind=0, round_id=1, honba=0,
++        kyoutaku=0, seat=0, compute_lookahead_flag=False)
++for ds in range(4):
++    v = unseen_obs(ds)[_OFFSET["unseen"]][27]
++    check(f"2 Est defausses par le siege {ds} : unseen = 2/4", abs(v - 0.5) < 1e-6, v)
++
+ # ===================================================================== #
+ failed = [r for r in RESULTS if not r[1]]
+ print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} controles OK")

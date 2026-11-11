@@ -1,0 +1,207 @@
+diff --git a/agents/oracle_agent.py b/agents/oracle_agent.py
+index 4829714..8bf0239 100644
+--- a/agents/oracle_agent.py
++++ b/agents/oracle_agent.py
+@@ -53,7 +53,8 @@ class OracleDiscardAgent:
+       depuis un SL a 12 blocs -- les blocs 12-15 restent aleatoires.
+     """
+     def __init__(self, sl_discard_path, sl_frozen_dir, device='cpu',
+-                 policy_lr=1e-4, critic_lr=1e-3):
++                 policy_lr=1e-4, critic_lr=1e-3,
++                 oracle_init='kaiming', oracle_scale=0.25):
+         self.device = device
+ 
+         # --- Policy : archi lue depuis le checkpoint SL discard ---
+@@ -66,10 +67,18 @@ class OracleDiscardAgent:
+         self.policy = build_model('discard', use_oracle=True,
+                                   channels=channels,
+                                   n_blocks=n_blocks).to(device)
+-        self._load_partial_sl(ck['model_state_dict'])
++        self._load_partial_sl(ck['model_state_dict'],
++                              oracle_init=oracle_init,
++                              oracle_scale=oracle_scale)
++        # [FIX ORACLE TAKEOFF] norme de reference des colonnes oracle pour
++        # monitorer la croissance (log du trainer).
++        with torch.no_grad():
++            self.oracle_init_norm = self.oracle_weight_norm()
+         print(f"[oracle_agent] discard SL charge "
+               f"(val_acc={ck.get('val_acc','?')}, "
+-              f"arch={channels}x{n_blocks})", flush=True)
++              f"arch={channels}x{n_blocks}, "
++              f"oracle_init={oracle_init}x{oracle_scale} "
++              f"||W_o||={self.oracle_init_norm:.4f})", flush=True)
+ 
+         # [ANCRE KL] Copie GELEE de la policy SL de depart. Sert de
+         # reference pour la penalite KL(pi || pi_SL) : sans ancrage le
+@@ -138,10 +147,25 @@ class OracleDiscardAgent:
+         self.policy.eval()
+         self.critic.eval()
+ 
+-    def _load_partial_sl(self, state_dict):
++    def oracle_weight_norm(self):
++        """Norme L2 des poids input_conv des ORACLE_DIM canaux oracle.
++        Indicateur d'usage de l'info cachee : reste a la valeur d'init si
++        la policy n'apprend pas a s'en servir."""
++        w = self.policy.trunk.input_conv.weight
++        return float(w[:, N_CHANNELS:, :, :].norm().item())
++
++    def _load_partial_sl(self, state_dict, oracle_init='kaiming',
++                         oracle_scale=0.25):
+         """Charge partiellement : le trunk (conv_in) attend 386 canaux mais
+         le SL en a 250. On étend les poids d'entrée en initialisant les
+         canaux oracle à 0.
++
++        [FIX ORACLE TAKEOFF] les canaux oracle sont initialises en Kaiming
++        x oracle_scale (defaut 0.25) au lieu de zero : a poids nuls
++        l'oracle n'influence pas les logits et doit croitre par pas PG
++        bruites -- trop lent a l'echelle du run (cf. oracle_weight_norm).
++        Les canaux ROUGES restent a zero (comportement initial == SL sur
++        la partie visible).
+         """
+         my_state = self.policy.state_dict()
+         for k, v in state_dict.items():
+@@ -151,10 +175,14 @@ class OracleDiscardAgent:
+                 my_state[k].copy_(v)
+             elif k == 'trunk.input_conv.weight':
+                 # [ROUGES] (256, 283, 3, 1) attendu ; le SL a 268 (ancien)
+-                # ou 279 (avec rouges) canaux : blocs absents = zeros.
+-                new_w = adapt_in_channels(v, my_state[k].shape[1])
++                # ou 279 (avec rouges) canaux : blocs absents = zeros,
++                # SAUF oracle (kaiming x scale, cf. [FIX ORACLE TAKEOFF]).
++                new_w = adapt_in_channels(v, my_state[k].shape[1],
++                                          oracle_init=oracle_init,
++                                          oracle_scale=oracle_scale)
+                 my_state[k].copy_(new_w)
+-                print(f"[oracle_agent] {k} etendu de {v.shape} a {new_w.shape}")
++                print(f"[oracle_agent] {k} etendu de {v.shape} a {new_w.shape} "
++                      f"(oracle_init={oracle_init}x{oracle_scale})")
+             # Les autres mismatch sont ignores (rare)
+         self.policy.load_state_dict(my_state)
+ 
+diff --git a/agents/suphx_cnn.py b/agents/suphx_cnn.py
+index 6a72643..3e693b8 100644
+--- a/agents/suphx_cnn.py
++++ b/agents/suphx_cnn.py
+@@ -26,7 +26,8 @@ ORACLE_DIM = 4
+ IN_CHANNELS_ORACLE = N_CHANNELS + ORACLE_DIM   # 283 (268 base + 11 rouges + 4 oracle)
+ 
+ 
+-def adapt_in_channels(w, target_in, dim=1):
++def adapt_in_channels(w, target_in, dim=1, oracle_init='zero',
++                      oracle_scale=1.0):
+     """Remet l'axe des canaux d'entree de `w` au layout de `target_in`.
+ 
+     Layouts reconnus (ordre des blocs : base | rouges | oracle) :
+@@ -34,6 +35,16 @@ def adapt_in_channels(w, target_in, dim=1):
+         272 = base + oracle        283 = base + rouges + oracle
+     Un bloc absent de la source est rempli de ZEROS (le modele se comporte
+     alors exactement comme avant) ; un bloc absent de la cible est retire.
++    EXCEPTION : oracle_init='kaiming' initialise le bloc ORACLE absent en
++    Kaiming x oracle_scale (les rouges restent toujours a zero : le
++    comportement au chargement reste celui du checkpoint source pour la
++    partie visible, seule l'info cachee demarre active).
++    [FIX ORACLE TAKEOFF] Un bloc oracle a poids nuls reçoit bien un
++    gradient, mais sa contribution aux logits reste nulle jusqu'a ce que
++    les poids croissent par des pas PG bruités : a l'echelle du run
++    (phase oracle = ~50 updates), la specialisation oracle n'a pas le
++    temps d'emergre. Une init non nulle donne a l'oracle une contribution
++    immediate que le PG peut renforcer ou affaiblir des le 1er update.
+     Une forme non reconnue est rendue telle quelle (le chargement echouera
+     avec le message PyTorch habituel).
+     """
+@@ -50,7 +61,8 @@ def adapt_in_channels(w, target_in, dim=1):
+     if cur not in layouts or target_in not in layouts:
+         return w
+     pieces, pos = [], 0
+-    for size, has_src, has_dst in zip(sizes, layouts[cur], layouts[target_in]):
++    for block_i, (size, has_src, has_dst) in enumerate(
++            zip(sizes, layouts[cur], layouts[target_in])):
+         piece = None
+         if has_src:
+             piece = w.narrow(dim, pos, size)
+@@ -59,7 +71,14 @@ def adapt_in_channels(w, target_in, dim=1):
+             if piece is None:
+                 shape = list(w.shape)
+                 shape[dim] = size
+-                piece = w.new_zeros(shape)
++                if block_i == 2 and oracle_init == 'kaiming':
++                    piece = torch.empty(shape, dtype=w.dtype,
++                                        device=w.device)
++                    torch.nn.init.kaiming_normal_(piece,
++                                                  nonlinearity='relu')
++                    piece = piece * oracle_scale
++                else:
++                    piece = w.new_zeros(shape)
+             pieces.append(piece)
+     return torch.cat(pieces, dim=dim).contiguous()
+ 
+diff --git a/training/train_rl_suphx.py b/training/train_rl_suphx.py
+index 36c7e68..0b56f17 100644
+--- a/training/train_rl_suphx.py
++++ b/training/train_rl_suphx.py
+@@ -512,6 +512,9 @@ def train(args):
+         device=device,
+         policy_lr=args.lr,
+         critic_lr=args.critic_lr,
++        # [FIX ORACLE TAKEOFF] init non nulle des canaux oracle + suivi
++        oracle_init=args.oracle_init,
++        oracle_scale=args.oracle_init_scale,
+     )
+ 
+     # --- Resume (optionnel) ---
+@@ -551,6 +554,11 @@ def train(args):
+ 
+             print(f"[train_rl]   -> step={start_step}, alpha={start_alpha:.4f}",
+                   flush=True)
++            # [FIX ORACLE TAKEOFF] la reference ||W_o|| apres resume est
++            # celle des poids RECHARgES (pas celle de l'init kaiming).
++            agent.oracle_init_norm = agent.oracle_weight_norm()
++            print(f"[train_rl]   ||W_oracle|| (resume) = "
++                  f"{agent.oracle_init_norm:.4f}", flush=True)
+         except Exception as e:
+             print(f"[train_rl] ECHEC resume : {e}", flush=True)
+ 
+@@ -855,6 +863,13 @@ def train(args):
+                 elapsed = time.time() - t_start
+                 metrics = compute_drift_metrics(batch)
+                 alerts = check_drift_alerts(metrics, phase)
++                # [ORACLE MONITOR] norme des colonnes oracle de input_conv :
++                # reste collee a la valeur d'init = la policy n'utilise pas
++                # l'info cachee (cf. --oracle-init).
++                wo_now = agent.oracle_weight_norm()
++                wo_str = (f"{wo_now:.4f} "
++                          f"(init {agent.oracle_init_norm:.4f}, "
++                          f"{(wo_now / max(agent.oracle_init_norm, 1e-8) - 1.0) * 100:+.1f}%)")
+                 rdev_str = (f"{ratio_dev_first:.3f}"
+                             if ratio_dev_first is not None else "n/a")
+                 kl_str = f"{kl_last:.4f}" if kl_last is not None else "off"
+@@ -888,7 +903,8 @@ def train(args):
+                         f"ret_mean={metrics['ret_mean']:+.2f} "
+                         f"| top3=[{metrics['actions_top3']}] "
+                         f"pgn={policy_gnorm.item():.2f} "
+-                        f"cgn={critic_gnorm.item():.2f}",
++                        f"cgn={critic_gnorm.item():.2f} "
++                        f"||W_o||={wo_str}",
+                         flush=True,
+                     )
+ 
+@@ -1055,6 +1071,19 @@ def main():
+ 
+     p.add_argument('--oracle-frac', type=float, default=0.20)
+     p.add_argument('--transition-frac', type=float, default=0.50)
++    p.add_argument('--oracle-init', choices=['zero', 'kaiming'],
++                   default='kaiming',
++                   help='[FIX ORACLE TAKEOFF] init des canaux oracle absents '
++                        'du checkpoint SL : zero (ancien, comportement '
++                        'initial == SL mais l oracle n influence pas les '
++                        'logits et doit croitre par pas PG bruites) ou '
++                        'kaiming (contribution immediate, le PG la renforce '
++                        'ou la corrige des le 1er update). Les canaux '
++                        'rouges restent a zero dans les deux cas.')
++    p.add_argument('--oracle-init-scale', type=float, default=0.25,
++                   help='echelle de l init kaiming des canaux oracle '
++                        '(0.25 : compromis mesure warm-start / vitesse de '
++                        'prise en charge de l oracle)')
+     p.add_argument('--grp-checkpoint', type=str,
+                    default='checkpoints/grp_sl_east4.pt')
+ 

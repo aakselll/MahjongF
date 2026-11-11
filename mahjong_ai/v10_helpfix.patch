@@ -1,0 +1,11 @@
+--- a/mahjong_ai/training/train_rl_suphx.py
++++ b/mahjong_ai/training/train_rl_suphx.py
+@@ -1105,7 +1105,7 @@
+                         "tenpai (calcule depuis les mains cachees, sans "
+                         "toucher au reseau). 0 = desactive. Conseille 0.5-1.0."
+                         " Credit par-decision exact ; en phase 1 l'oracle "
+-                        "rend le danger lisible -> KPI dng% dans les logs.")
++                        "rend le danger lisible -> KPI dng%% dans les logs.")
+     p.add_argument('--adv-mode', choices=['batch_mean', 'critic'],
+                    default='batch_mean',
+                    help="avantage : 'batch_mean' (A = R - moyenne du batch, "

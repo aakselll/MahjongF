@@ -1,0 +1,13 @@
+diff --git a/agents/oracle_agent.py b/agents/oracle_agent.py
+index 33613b8..f95d7ad 100644
+--- a/agents/oracle_agent.py
++++ b/agents/oracle_agent.py
+@@ -239,7 +239,7 @@ class OracleDiscardAgent:
+                              device=self.device).unsqueeze(0)
+         mask_t = torch.as_tensor(mask, dtype=torch.float32,
+                                  device=self.device).unsqueeze(0)
+-        oo = torch.zeros(1, ORACLE_DIM, dtype=torch.float32,
++        oo = torch.zeros(1, ORACLE_DIM, on.shape[-1], dtype=torch.float32,
+                          device=self.device)
+         x = torch.cat([on, oo], dim=1)
+         with torch.no_grad():

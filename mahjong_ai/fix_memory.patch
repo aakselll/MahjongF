@@ -1,0 +1,258 @@
+diff --git a/training/self_play_worker.py b/training/self_play_worker.py
+index 0c77235..6c65e69 100644
+--- a/training/self_play_worker.py
++++ b/training/self_play_worker.py
+@@ -111,12 +111,24 @@ def worker_loop(worker_id, state, lock, transitions_queue,
+                 # [NIVEAU 2] put au lieu de buffer_add.
+                 # timeout : ne pas bloquer indefiniment si le trainer est
+                 # mort (Queue pleine -> exception -> arret propre).
+-                try:
+-                    transitions_queue.put(transitions, timeout=30.0)
+-                except Exception:
++                # [FIX MEMOIRE] La Queue est volontairement PETITE
++                # (backpressure) : une file momentanement pleine est normale
++                # quand le trainer est occupe. On reessaie (6 x 30 s) avant
++                # de conclure que le trainer est mort.
++                put_ok = False
++                for _attempt in range(6):
++                    try:
++                        transitions_queue.put(transitions, timeout=30.0)
++                        put_ok = True
++                        break
++                    except Exception:
++                        print(f"[worker {worker_id}] Queue pleine/indisponible "
++                              f"(essai {_attempt + 1}/6)", flush=True)
++                if not put_ok:
+                     print(f"[worker {worker_id}] Queue indisponible -- "
+                           f"arret du worker", flush=True)
+                     return
++                transitions = None      # libere la partie des que envoyee
+             # [STATS] mise a jour du proxy partage
+             if game_stats is not None:
+                 _update_stats(stats_proxy, lock, game_stats)
+@@ -229,7 +241,11 @@ def _play_one_game(env, agent, gamma_t):
+             pending_reward[seat] = 0.0
+             transitions.append({
+                 'seat': seat,
+-                'obs_normal': obs_n,
++                # [FIX MEMOIRE] float16 : ~18 Ko au lieu de ~36 Ko par coup.
++                # Les canaux sont binaires (hands >= n) ou multiples de 1/4
++                # (unseen/4) : exacts en float16. pg_is_loss reconvertit en
++                # float32 (torch.as_tensor(..., dtype=float32)).
++                'obs_normal': np.asarray(obs_n, dtype=np.float16),
+                 'obs_oracle': masked_obs_o,
+                 'mask': mask,
+                 'action': action,
+diff --git a/training/train_rl_suphx.py b/training/train_rl_suphx.py
+index e74103d..89581e6 100644
+--- a/training/train_rl_suphx.py
++++ b/training/train_rl_suphx.py
+@@ -50,6 +50,7 @@ Usage :
+ """
+ import argparse
+ import collections
++import gc
+ import multiprocessing as mp
+ import os
+ import threading
+@@ -58,6 +59,11 @@ import time
+ import numpy as np
+ import torch
+ 
++try:                      # garde memoire optionnelle : pip install psutil
++    import psutil
++except ImportError:
++    psutil = None
++
+ from mahjong_ai.agents.oracle_agent import OracleDiscardAgent
+ from mahjong_ai.training.parameter_server import (
+     ParameterServer, publish_to_state,
+@@ -160,6 +166,29 @@ def _purge_old_checkpoints(base_path, keep_n):
+                 pass
+ 
+ 
++# ---------------------------------------------------------------------- #
++# Garde memoire
++# ---------------------------------------------------------------------- #
++def apply_mem_guard(rb_local, rb_lock, buf_cap, mem_pct, limit_pct, floor):
++    """Reduit durablement la capacite du buffer si la RAM depasse le seuil.
++
++    buf_cap : liste a 1 element (capacite en parties, lue par le thread de
++              drain). Ne remonte jamais d'elle-meme.
++    Retourne (action, n_supprimees, capacite) ; action = None (RAM ok),
++    'shrunk' (buffer reduit) ou 'at_floor' (deja au plancher).
++    """
++    if mem_pct is None or mem_pct < limit_pct:
++        return None, 0, buf_cap[0]
++    with rb_lock:
++        new_cap = max(floor, len(rb_local) // 2)
++        if new_cap < buf_cap[0]:
++            buf_cap[0] = new_cap
++            n_drop = max(0, len(rb_local) - new_cap)
++            del rb_local[:n_drop]
++            return 'shrunk', n_drop, new_cap
++    return 'at_floor', 0, buf_cap[0]
++
++
+ # ---------------------------------------------------------------------- #
+ # Drift tracking helpers
+ # ---------------------------------------------------------------------- #
+@@ -360,16 +389,27 @@ def train(args):
+     # Manager sollicitee par 4 workers a chaque partie -- tuait le serveur
+     # Manager sous Windows au bout de ~75 min de charge IPC. Le Manager ne
+     # porte plus desormais que l'etat leger (poids, stats).
+-    transitions_queue = mp.Queue(maxsize=args.buffer_size)
++    #
++    # [FIX MEMOIRE] La Queue ne doit PAS etre dimensionnee comme le buffer :
++    # chaque element est une PARTIE entiere (~400 coups x 268x34 float32 =
++    # ~15 Mo) et le feeder thread de chaque worker garde une copie non
++    # serialisee de tout ce qui attend d'entrer dans le pipe. Avec
++    # maxsize=500 on pouvait empiler plusieurs Go cote workers EN PLUS du
++    # buffer du trainer (MemoryError a ~2.46M steps). Le thread de drain
++    # vide la Queue en continu : quelques elements suffisent.
++    queue_size = args.queue_size or max(4, 2 * args.n_workers)
++    transitions_queue = mp.Queue(maxsize=queue_size)
+ 
+     # Buffer LOCAL au process principal : liste ordinaire protegee par un
+     # lock, remplie par un thread daemon qui draine la Queue.
+     rb_local = []
+     rb_lock = threading.Lock()
++    # Capacite du buffer (en parties), modifiable par la garde memoire.
++    buf_cap = [args.buffer_size]
+ 
+     import queue as _queue_mod
+ 
+-    def _drain_queue(q, rb_list, lock, buffer_max):
++    def _drain_queue(q, rb_list, lock, cap):
+         """Draine la Queue vers le buffer local (thread daemon).
+ 
+         get(timeout=1.0) : le thread verifie periodiquement s'il doit
+@@ -380,7 +420,7 @@ def train(args):
+                 item = q.get(timeout=1.0)
+                 with lock:
+                     rb_list.append(item)
+-                    while len(rb_list) > buffer_max:
++                    while len(rb_list) > cap[0]:
+                         rb_list.pop(0)
+             except _queue_mod.Empty:
+                 continue
+@@ -390,11 +430,20 @@ def train(args):
+ 
+     drain_thread = threading.Thread(
+         target=_drain_queue,
+-        args=(transitions_queue, rb_local, rb_lock, args.buffer_size),
++        args=(transitions_queue, rb_local, rb_lock, buf_cap),
+         daemon=True,
+     )
+     drain_thread.start()
+ 
++    # [FIX MEMOIRE] garde RAM (optionnelle, necessite psutil)
++    def _mem_percent():
++        return psutil.virtual_memory().percent if psutil is not None else None
++
++    print(f"[train_rl] memoire : buffer={args.buffer_size} parties, "
++          f"queue={queue_size}, garde RAM "
++          f"{'>= %.0f%%' % args.mem_limit_pct if psutil else 'INACTIVE (pip install psutil)'}",
++          flush=True)
++
+     # --- Agent ---
+     agent = OracleDiscardAgent(
+         sl_discard_path=args.sl_discard,
+@@ -485,8 +534,28 @@ def train(args):
+     # d'urgence) -- calcule une fois, hors de la boucle.
+     base_out = args.output[:-3] if args.output.endswith('.pt') else args.output
+ 
++    last_mem_warn = 0.0
+     try:
+         while step < args.total_steps:
++            # [FIX MEMOIRE] Garde RAM : si la memoire systeme depasse le
++            # seuil, on reduit durablement la capacite du buffer (et on le
++            # tronque) plutot que de mourir en MemoryError. Plancher : 2x
++            # batch_episodes, pour ne jamais affamer l'entrainement.
++            mem_pct = _mem_percent()
++            guard, n_drop, new_cap = apply_mem_guard(
++                rb_local, rb_lock, buf_cap, mem_pct, args.mem_limit_pct,
++                floor=max(2 * args.batch_episodes, 1))
++            if guard == 'shrunk':
++                gc.collect()
++                print(f"[mem] RAM {mem_pct:.0f}% >= "
++                      f"{args.mem_limit_pct:.0f}% : capacite buffer -> "
++                      f"{new_cap} parties ({n_drop} supprimees)", flush=True)
++            elif guard == 'at_floor' and time.time() - last_mem_warn > 60:
++                last_mem_warn = time.time()
++                print(f"[mem] RAM {mem_pct:.0f}% : buffer deja au plancher "
++                      f"({buf_cap[0]} parties) -- fermer d'autres programmes "
++                      f"ou baisser --n-workers", flush=True)
++
+             # [NIVEAU 2] Echantillonnage depuis le buffer local.
+             # [NIVEAU 2] Echantillonnage depuis le buffer local.
+             # [FIX FORMAT] rb_local contient des EPISODES (listes de
+@@ -630,6 +699,19 @@ def train(args):
+             if step % args.log_every < len(batch):
+                 with rb_lock:
+                     current_buf = len(rb_local)
++                    last_ep = rb_local[-1] if rb_local else None
++                # [MEMOIRE] taille REELLE du buffer (estimee sur la derniere
++                # partie recue) et RAM systeme.
++                buf_mb = 0.0
++                if last_ep:
++                    ep_bytes = sum(t['obs_normal'].nbytes
++                                   + t['obs_oracle'].nbytes
++                                   + t['mask'].nbytes for t in last_ep)
++                    buf_mb = ep_bytes * current_buf / 1e6
++                ram_pct = _mem_percent()
++                mem_info = (f"({buf_mb:.0f}MB"
++                            + (f",ram={ram_pct:.0f}%" if ram_pct is not None
++                               else "") + ")")
+                 elapsed = time.time() - t_start
+                 metrics = compute_drift_metrics(batch)
+                 alerts = check_drift_alerts(metrics, phase)
+@@ -643,7 +725,7 @@ def train(args):
+                       f"alpha={alpha:.4f} "
+                       f"rdev={rdev_str} "
+                       f"gamma={gamma_t:.3f} "
+-                      f"buf={current_buf} "
++                      f"buf={current_buf}{mem_info} "
+                       f"({elapsed:.0f}s)", flush=True)
+ 
+                 if metrics is not None:
+@@ -697,11 +779,20 @@ def train(args):
+                       flush=True)
+ 
+     except (BrokenPipeError, ConnectionError, ConnectionResetError,
+-            EOFError, IndexError, OSError) as e:
++            EOFError, IndexError, OSError, MemoryError) as e:
+         # [FIX CRASH] Sauvegarde d'URGENCE avant de mourir. Le serveur
+         # Manager sous Windows peut mourir sous la charge IPC : tous les
+         # proxies deviennent invalides en cascade. Sans ce bloc, perte
+         # totale du run si le crash arrive avant save_every.
++        # [FIX MEMOIRE] MemoryError ajoute (il n'etait pas capture : aucun
++        # checkpoint de crash n'avait ete ecrit). On libere d'abord le
++        # buffer pour avoir la place d'ecrire.
++        try:
++            with rb_lock:
++                rb_local.clear()
++            gc.collect()
++        except Exception:
++            pass
+         print(f"\n[train_rl] !!! CRASH a step={step} : "
+               f"{type(e).__name__}: {e}", flush=True)
+         print(f"[train_rl] Sauvegarde d'URGENCE des poids...", flush=True)
+@@ -747,7 +838,16 @@ def main():
+     p.add_argument('--total-steps', type=int, default=1000000)
+     p.add_argument('--n-workers', type=int, default=4)
+     p.add_argument('--games-per-cycle', type=int, default=10)
+-    p.add_argument('--buffer-size', type=int, default=500)
++    p.add_argument('--buffer-size', type=int, default=150,
++                   help="capacite du buffer, en PARTIES (~15 Mo chacune en "
++                        "float16 : 150 parties ~ 1.5-3 Go). Etait 500 "
++                        "(7+ Go) -> MemoryError.")
++    p.add_argument('--queue-size', type=int, default=None,
++                   help="taille de la mp.Queue (defaut : max(4, 2*n_workers)). "
++                        "Doit rester PETITE : chaque element est une partie.")
++    p.add_argument('--mem-limit-pct', type=float, default=88.0,
++                   help="seuil de RAM systeme (%%) au-dela duquel le buffer "
++                        "est reduit (necessite psutil)")
+     p.add_argument('--batch-episodes', type=int, default=20)
+     p.add_argument('--max-batch-transitions', type=int, default=1000)
+ 

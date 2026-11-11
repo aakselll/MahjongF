@@ -1,0 +1,356 @@
+diff --git a/envs/multi_agent.py b/envs/multi_agent.py
+index eb1e91e..6261cef 100644
+--- a/envs/multi_agent.py
++++ b/envs/multi_agent.py
+@@ -105,6 +105,9 @@ class MultiAgentMahjongEnv:
+         self.ura_dora_indicators = None
+         self.riichi = None
+         self.riichi_deposits = 0
++        # [FIX BATONS RIICHI] cout de baton deja paye CETTE manche, par
++        # siege interne (unite reward, positif = paye). Applique dans _final.
++        self.stick_paid = [0.0, 0.0, 0.0, 0.0]
+         self._furiten_temp = [False, False, False, False]
+         self._abortive_riichi_count = 0
+         self._abortive_kan_count = 0
+@@ -150,11 +153,16 @@ class MultiAgentMahjongEnv:
+                 self._stats["yaku_counts"][y.name] = \
+                     self._stats["yaku_counts"].get(y.name, 0) + 1
+ 
+-    def set_game_context(self, round_wind_idx, round_idx, scores, honba=0):
++    def set_game_context(self, round_wind_idx, round_idx, scores, honba=0,
++                         kyoutaku=0):
++        # kyoutaku : batons de riichi restes sur la table (manche nulle
++        # precedente) ; ils sont deja payes, reportes ici et empoches par
++        # le prochain gagnant.
+         self.ctx = {"round_wind_idx": int(round_wind_idx),
+                     "round_idx": int(round_idx),
+                     "scores": [float(x) for x in scores],
+-                    "honba": int(honba)}
++                    "honba": int(honba),
++                    "kyoutaku": int(kyoutaku)}
+ 
+     def reset_round(self):
+         while True:
+@@ -200,7 +208,9 @@ class MultiAgentMahjongEnv:
+         self.melds = [[] for _ in range(4)]
+         self.discards = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
+         self.riichi = [False, False, False, False]
+-        self.riichi_deposits = 0
++        # [FIX BATONS RIICHI] on repart des batons reportes (0 par defaut).
++        self.riichi_deposits = int(self.ctx.get("kyoutaku", 0))
++        self.stick_paid = [0.0, 0.0, 0.0, 0.0]
+         self._furiten_temp = [False, False, False, False]
+         self._abortive_riichi_count = 0
+         self._abortive_kan_count = 0
+@@ -466,11 +476,12 @@ class MultiAgentMahjongEnv:
+         return None
+ 
+     def _abortive_draw_rewards(self, exclude=None):
+-        r = self._zero_rewards()
+-        for s in range(4):
+-            if self.riichi[s] and s != exclude:
+-                r[s] += RIICHI_STICK_NET_COST * REWARD_SCALE
+-        return r
++        # [FIX BATONS RIICHI] Avant : +1.0 de "remboursement" a chaque
++        # riichi, pour un baton jamais debite -> argent cree de rien. Les
++        # regles reelles ne remboursent pas : les batons restent sur la
++        # table (reportes a la manche suivante). Le cout est deja dans
++        # stick_paid, applique par _final. `exclude` garde pour compat.
++        return self._zero_rewards()
+ 
+     def _chow_variants(self, seat, tile):
+         if not self._is_suited(tile):
+@@ -647,10 +658,17 @@ class MultiAgentMahjongEnv:
+         try:
+             import torch
+             obs = self._build_obs(seat, pending_claim_tile=pending_claim_tile)
+-            obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
+             model = self.frozen_sl[head]
++            # [FIX DEVICE] Les tetes gelees vivent sur le device du worker
++            # (cuda:0 en entrainement GPU) ; l'obs etait creee sur CPU ->
++            # "Expected all tensors to be on the same device". L'ancien
++            # `except Exception: return None` avalait l'erreur : AUCUNE tete
++            # SL (riichi/pon/chow/kong) ne fonctionnait en entrainement GPU.
++            dev = next(model.parameters()).device
++            obs_t = torch.as_tensor(obs, dtype=torch.float32,
++                                    device=dev).unsqueeze(0)
+             with torch.no_grad():
+-                logits = model(obs_t)[0].numpy()
++                logits = model(obs_t)[0].cpu().numpy()
+             # [FIX MASQUE] logits * mask ne masque pas : une action illegale
+             # vaut 0 et gagne l'argmax des que tous les logits legaux sont
+             # negatifs (ex. chow : variante illegale choisie -> main
+@@ -723,10 +741,18 @@ class MultiAgentMahjongEnv:
+                 "round_done": False, "final_rewards": None,
+                 "next_request": next_request}
+ 
+-    @staticmethod
+-    def _final(imm_reward, acting_seat, final_rewards, outcome):
++    def _final(self, imm_reward, acting_seat, final_rewards, outcome):
+         if acting_seat is not None:
+             final_rewards[acting_seat] = final_rewards.get(acting_seat, 0.0) + imm_reward
++        # [FIX BATONS RIICHI] Le cout du baton (-1000 a la declaration) etait
++        # range dans `pending`, ecrase des le discard suivant, donc jamais
++        # preleve : un riichi etait GRATUIT et les batons empoches par le
++        # gagnant n'avaient jamais ete payes (somme des scores non nulle).
++        # Preleve ici, pour TOUTES les issues de manche (tsumo, ron, chankan,
++        # exhaustive, abortives), independamment de `pending`.
++        for s in range(4):
++            if self.stick_paid[s]:
++                final_rewards[s] = final_rewards.get(s, 0.0) - self.stick_paid[s]
+         return {"imm_reward": None, "acting_seat": None,
+                 "round_done": True, "final_rewards": final_rewards,
+                 "next_request": None, "outcome": outcome}
+@@ -911,12 +937,15 @@ class MultiAgentMahjongEnv:
+                         self._ippatsu[seat] = True
+                         self.riichi[seat] = True
+                         self.riichi_deposits += 1
++                        # [FIX BATONS RIICHI] cout enregistre ici, preleve
++                        # en fin de manche par _final (et non plus dans
++                        # `pending`, ecrase au discard suivant).
++                        self.stick_paid[seat] += RIICHI_STICK_NET_COST * REWARD_SCALE
+                         self._abortive_riichi_count += 1
+                         forced_discard_mask = np.zeros(N_TILES, dtype=np.float32)
+                         for t in riichi_options:
+                             forced_discard_mask[t] = 1.0
+-                        pending = (-RIICHI_STICK_NET_COST * REWARD_SCALE
+-                                    + RIICHI_DECLARE_BONUS, seat)
++                        pending = (RIICHI_DECLARE_BONUS, seat)
+                         abort = self._check_abortive_draw()
+                         if abort:
+                             self._stats[abort] += 1
+diff --git a/B/test_riichi_sticks.py b/test_riichi_sticks.py
+new file mode 100644
+index 0000000..b1f859e
+--- /dev/null
++++ b/test_riichi_sticks.py
+@@ -0,0 +1,148 @@
++"""
++test_riichi_sticks.py — Comptabilite des batons de riichi (vraie lib mahjong).
++
++Regression du bug : le cout du baton etait range dans `pending`, ecrase au
++discard suivant -> un riichi etait gratuit et le gagnant empochait des batons
++que personne n'avait payes. Verifie aussi le report des batons apres une
++manche sans gagnant et le renchan du dealer en riichi.
++
++Usage :
++    py -3.14 -m mahjong_ai.test_riichi_sticks
++"""
++import numpy as np
++
++import mahjong_ai.envs.multi_agent as ma
++from mahjong_ai.envs.multi_agent import (
++    MultiAgentMahjongEnv, DISCARD, RIICHI, RIICHI_YES,
++)
++from mahjong_ai.training.game_env import GameEnv
++
++RESULTS = []
++
++
++def check(name, cond, detail=""):
++    RESULTS.append((name, bool(cond)))
++    print(f"  [{'OK  ' if cond else 'FAIL'}] {name}"
++          + ("" if cond else f"   {detail}"))
++
++
++# Dealer tenpai (123456789m 111p + 9s, attente tanki), mains junk ailleurs.
++TENPAI = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 26]
++JUNK = [0, 4, 8, 9, 13, 17, 18, 22, 26, 27, 29, 31, 33]
++
++
++def make_env(hands, wall_full, seed=11):
++    env = MultiAgentMahjongEnv(seed=seed, compute_lookahead=False)
++    original_deal = env._deal
++
++    def custom_deal():
++        original_deal()
++        for s in range(4):
++            h = np.zeros(34, dtype=np.int32)
++            for t in hands[s]:
++                h[t] += 1
++            env.hands[s] = h
++        env.wall = list(wall_full)
++        env._initial_wall_size = len(env.wall)
++
++    env._deal = custom_deal
++    return env
++
++
++def lowest_legal(req):
++    return int(np.nonzero(req["mask"] > 0)[0][0])
++
++
++def play_round(step_fn, req, env_riichi_flags):
++    """Joue jusqu'a la fin de manche. Dealer : RIICHI_YES puis defausse 26."""
++    while True:
++        t = req["action_type"]
++        if t == DISCARD:
++            m = req["mask"]
++            if req["seat"] == 0 and m[26] > 0 and not env_riichi_flags()[0]:
++                act = 26
++            else:
++                act = lowest_legal(req)
++        elif t == RIICHI:
++            act = RIICHI_YES
++        else:
++            act = 0                      # pas de pon/chi/kan/ron
++        res = step_fn(act)
++        if res["round_done"]:
++            return res
++        req = res["next_request"]
++
++
++def test_riichi_survives_to_exhaustive():
++    print("\n=== B1 : dealer en riichi -> exhaustive : le baton est preleve ===")
++    ma.EXHAUSTIVE_SHANTEN_COEF = 0.0           # somme exacte, sans shaping
++    # pioches (de la fin) : dealer 33, puis honneurs ; jamais 33 ensuite
++    wall = [28, 28, 28, 28, 27, 29, 30, 33]
++    env = make_env([TENPAI, JUNK, JUNK, JUNK], wall)
++    ge = GameEnv(seed=1)
++    ge.round_env = env
++    req = ge.reset_round()
++    res = play_round(lambda a: ge.step(a), req, lambda: env.riichi)
++    fr = res["final_rewards"]
++    check("manche = exhaustive", res["outcome"] == "exhaustive", res["outcome"])
++    check("dealer : +3.0 (tenpai) -1.0 (baton) = +2.0",
++          abs(fr[0] - 2.0) < 1e-9, fr[0])
++    check("les 3 noten paient 1.0",
++          all(abs(fr[s] + 1.0) < 1e-9 for s in (1, 2, 3)), fr)
++    check("baton reporte (GameEnv.kyoutaku == 1)", ge.kyoutaku == 1, ge.kyoutaku)
++    check("conservation : somme des scores + batons == 0",
++          abs(sum(ge.game_scores) + ge.kyoutaku) < 1e-9,
++          (ge.game_scores, ge.kyoutaku))
++    check("dealer tenpai en riichi garde le renchan",
++          ge.honba == 1 and ge.dealer_seat == 0, (ge.honba, ge.dealer_seat))
++
++    print("\n=== B2 : manche suivante : le gagnant empoche le baton reporte ===")
++    s1 = [0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 8]       # tanki 8m (cf. T8)
++    env2 = make_env([JUNK, s1, JUNK, JUNK], [7, 27])
++    ge.round_env = env2
++    req = ge.reset_round()
++    check("la manche demarre avec 1 baton sur la table",
++          env2.riichi_deposits == 1, env2.riichi_deposits)
++    res = ge.step(33)                                   # le dealer defausse
++    fr = res["final_rewards"]
++    check("tsumo du siege 1", res["outcome"] == "tsumo", res["outcome"])
++    check("batons empoches (kyoutaku remis a 0)", ge.kyoutaku == 0, ge.kyoutaku)
++    # Si ceci echoue alors que B1 passe : cost['total'] de la lib n'inclut pas
++    # kyoutaku_bonus comme _distribute_win_payment le suppose.
++    check("conservation apres 2 manches : somme des scores == 0",
++          abs(sum(ge.game_scores)) < 1e-9, (ge.game_scores, fr))
++
++
++def test_stick_not_overwritten():
++    print("\n=== B3 : le baton n'est plus ecrase par les coups suivants ===")
++    env = make_env([TENPAI, JUNK, JUNK, JUNK], [28, 28, 28, 28, 27, 29, 30, 33])
++    req = env.reset_round()
++    res = env.step(RIICHI_YES)
++    check("stick_paid enregistre a la declaration", env.stick_paid[0] == 1.0)
++    res = env.step(26)
++    for _ in range(6):
++        if res["round_done"]:
++            break
++        r = res["next_request"]
++        res = env.step(lowest_legal(r) if r["action_type"] == DISCARD else 0)
++    check("stick_paid toujours la apres plusieurs coups", env.stick_paid[0] == 1.0)
++
++
++def test_abortive_no_refund():
++    print("\n=== B4 : abortive 4 riichi : 4 batons payes, aucun remboursement ===")
++    env = make_env([JUNK] * 4, [1, 2, 3, 4])
++    env._deal()
++    env.stick_paid = [1.0, 1.0, 1.0, 1.0]
++    out = env._final(0.0, None, env._abortive_draw_rewards(), "abortive_4riichi")
++    check("chacun paie 1.0",
++          all(abs(out["final_rewards"][s] + 1.0) < 1e-9 for s in range(4)),
++          out["final_rewards"])
++
++
++if __name__ == '__main__':
++    test_riichi_survives_to_exhaustive()
++    test_stick_not_overwritten()
++    test_abortive_no_refund()
++    n_fail = sum(1 for _, ok in RESULTS if not ok)
++    print(f"\n{len(RESULTS) - n_fail}/{len(RESULTS)} OK")
++    raise SystemExit(1 if n_fail else 0)
+diff --git a/training/game_env.py b/training/game_env.py
+index 103249d..4c083e7 100644
+--- a/training/game_env.py
++++ b/training/game_env.py
+@@ -88,6 +88,9 @@ class GameEnv:
+         self.prev_phi = [0.0] * 4
+         self.is_enchousen = False
+         self.end_reason = None
++        # [FIX BATONS RIICHI] batons restes sur la table apres une manche
++        # sans gagnant ; empoches par le prochain gagnant.
++        self.kyoutaku = 0
+ 
+     def _seat_mapping(self):
+         return [(self.dealer_seat + i) % 4 for i in range(4)]
+@@ -103,6 +106,7 @@ class GameEnv:
+             round_idx=self.round_num - 1,
+             scores=[self.game_scores[mapping[i]] for i in range(4)],
+             honba=self.honba,
++            kyoutaku=self.kyoutaku,
+         )
+         req = self.round_env.reset_round()
+         return self._translate_request(req)
+@@ -232,10 +236,23 @@ class GameEnv:
+         # ---- Decide repeat dealer ----
+         outcome = result.get('outcome', 'unknown')
+         dealer_real = mapping[0]
+-        dealer_round_reward = real_round_rewards[dealer_real]
++        # [FIX BATONS RIICHI] Le reward du dealer contient desormais son
++        # propre baton (-1.0 s'il a declare riichi). Les decisions de renchan
++        # / fin de partie se basent sur le gain HORS baton : sinon, a
++        # l'exhaustive avec les 4 joueurs tenpai (paiement 0), un dealer en
++        # riichi serait a -1.0 (< 0) et perdrait son renchan a tort.
++        dealer_round_reward = (real_round_rewards[dealer_real]
++                               + self.round_env.stick_paid[0])
+         dealer_repeats, honba_increments = _decide_dealer_repeat(
+             outcome, dealer_round_reward)
+ 
++        # [FIX BATONS RIICHI] report des batons : empoches par un gagnant,
++        # sinon ils restent sur la table pour la manche suivante.
++        if outcome in ("tsumo", "ron", "multi_ron"):
++            self.kyoutaku = 0
++        else:
++            self.kyoutaku = int(self.round_env.riichi_deposits)
++
+         # ---- Regles de fin ----
+         game_done, end_reason = self._check_game_end(
+             outcome, dealer_repeats, dealer_real, dealer_round_reward)
+diff --git a/training/train_rl_suphx.py b/training/train_rl_suphx.py
+index 7ee2b20..e74103d 100644
+--- a/training/train_rl_suphx.py
++++ b/training/train_rl_suphx.py
+@@ -670,6 +670,19 @@ def train(args):
+                 for a in alerts:
+                     print(f"    | !! {a}", flush=True)
+ 
++                # [FAIL-FAST] Une tete SL figee en erreur (ou une requete
++                # non-DISCARD inattendue) fausse toutes les parties : plus de
++                # riichi/pon/chow corrects. S'entrainer dessus est du temps
++                # perdu -> on s'arrete (sauf --allow-sl-errors).
++                n_err = stats_proxy.get('n_sl_errors', 0)
++                n_unh = stats_proxy.get('n_unhandled', 0)
++                if (n_err or n_unh) and not args.allow_sl_errors:
++                    raise RuntimeError(
++                        f"tetes SL figees en erreur (n_sl_errors={n_err}, "
++                        f"n_unhandled={n_unh}) : parties invalides. "
++                        f"Voir le traceback [env] plus haut. "
++                        f"--allow-sl-errors pour ignorer.")
++
+             if step % args.save_every < len(batch):
+                 os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
+                 step_path = f"{base_out}_step{step:07d}.pt"
+@@ -748,6 +761,9 @@ def main():
+                    help="entropie cible (Eq. 3) : un nombre, ou 'auto' = "
+                         "entropie mesuree de la policy au demarrage "
+                         "(voir --h-calib-updates / --h-target-mult)")
++    p.add_argument('--allow-sl-errors', action='store_true',
++                   help="ne pas s'arreter si une tete SL figee echoue "
++                        "(deconseille : parties invalides)")
+     p.add_argument('--h-calib-updates', type=int, default=5,
+                    help="nb d'updates moyennes pour --h-target auto")
+     p.add_argument('--h-target-mult', type=float, default=1.0,

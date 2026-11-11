@@ -1,0 +1,89 @@
+From a018e42d0aa1f9e3b4fa32e481bcdfa3600b3479 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 28 Oct 2026 20:27:05 +0100
+Subject: [PATCH] eval_stable_rank: --oracle-gamma (diagnostic oracle utilise
+ ou non)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01J8SjMHFcdr3YFh7Ebm6sJS
+---
+ training/eval_stable_rank.py | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/training/eval_stable_rank.py b/training/eval_stable_rank.py
+index c70ce2d..d5de8c5 100644
+--- a/training/eval_stable_rank.py
++++ b/training/eval_stable_rank.py
+@@ -76,8 +76,12 @@ class SLWeakAgent:
+ 
+ class RLAgent:
+     def __init__(self, checkpoint, sl_discard, sl_frozen, device='cpu',
+-                 sample=False):
++                 sample=False, oracle_gamma=0.0):
+         self.sample = sample
++        # [DIAG ORACLE] 0.0 = deploiement (oracle coupe) ; 1.0 = oracle
++        # complet visible. Comparer les deux rangs sur le meme checkpoint
++        # dit si la policy utilise reellement l'info cachee.
++        self.oracle_gamma = oracle_gamma
+         from mahjong_ai.agents.oracle_agent import OracleDiscardAgent
+         self.agent = OracleDiscardAgent(sl_discard, sl_frozen, device=device)
+         ck = torch.load(checkpoint, map_location=device, weights_only=False)
+@@ -106,7 +110,8 @@ class RLAgent:
+         mask_t = torch.as_tensor(mask, dtype=torch.float32,
+                                   device=self.device).unsqueeze(0)
+         with torch.no_grad():
+-            logits, _, _ = self.agent.forward_with_dropout(on, oo, gamma_t=0.0)
++            logits, _, _ = self.agent.forward_with_dropout(
++                on, oo, gamma_t=self.oracle_gamma)
+             masked = logits + (mask_t - 1.0) * 1e9
+             if self.sample:
+                 # [EVAL] politique echantillonnee, comme a l'entrainement
+@@ -120,7 +125,7 @@ class RLAgent:
+ # ====================================================================== #
+ def eval_worker(worker_id, n_games, agent_checkpoint, sl_discard,
+                  sl_frozen, weak_dir, device='cpu', seed=0, sample=False,
+-                 worker_offset=0):
++                 worker_offset=0, oracle_gamma=0.0):
+     """Chaque worker : charge ses propres modeles (thread-safe car process).
+ 
+     Retourne (n1, n2, n3, n4) sur n_games parties.
+@@ -136,7 +141,7 @@ def eval_worker(worker_id, n_games, agent_checkpoint, sl_discard,
+     t_load = time.time()
+     torch.manual_seed(seed + worker_id)
+     rl_agent = RLAgent(agent_checkpoint, sl_discard, sl_frozen, device,
+-                       sample=sample)
++                       sample=sample, oracle_gamma=oracle_gamma)
+     weak = SLWeakAgent(weak_dir, device)
+     print(f"[worker {worker_id}] modeles charges en "
+           f"{time.time()-t_load:.1f}s (threads={threads})", flush=True)
+@@ -250,7 +255,7 @@ def evaluate(args):
+             continue
+         tasks.append((i, splits[i], args.agent_checkpoint, args.sl_discard,
+                        args.sl_frozen, args.weak_dir, device, args.seed,
+-                       args.sample, sum(splits[:i])))
++                       args.sample, sum(splits[:i]), args.oracle_gamma))
+ 
+     print(f"[eval] lancement de {len(tasks)} workers...", flush=True)
+ 
+@@ -282,6 +287,8 @@ def evaluate(args):
+     print(f"  Rang moyen           : {mr:.3f} +- {mr_ci:.3f} (95 %)  "
+           f"[2.500 = niveau egal]")
+     print(f"  Stable rank (Tenhou) : {sr:.4f}  IC95 [{sr_lo:.2f}, {sr_hi:.2f}]")
++    print(f"  Oracle (gamma)       : {args.oracle_gamma} "
++          f"(0 = deploiement, 1 = oracle complet)")
+     print(f"  Mode joueur eval     : "
+           f"{'echantillonne' if args.sample else 'argmax'}, sieges alternes")
+     if total < 1000:
+@@ -305,6 +312,9 @@ def main():
+     p.add_argument('--sample', action='store_true',
+                    help='le RL echantillonne sa politique (comme a '
+                         "l'entrainement) au lieu de l'argmax")
++    p.add_argument('--oracle-gamma', type=float, default=0.0,
++                   help='[DIAG] proportion d oracle visible pour le RL : '
++                        '0 = deploiement (defaut), 1 = oracle complet')
+     args = p.parse_args()
+     evaluate(args)
+ 
+-- 
+2.43.0
+

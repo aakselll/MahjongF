@@ -1,0 +1,90 @@
+From d3e6e2db079afffdb509914440216663ea3de848 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 31 Oct 2026 13:45:52 +0100
+Subject: [PATCH] eval_stable_rank: --weak-sample (adversaires SL
+ echantillonnes)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01J8SjMHFcdr3YFh7Ebm6sJS
+---
+ training/eval_stable_rank.py | 20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/training/eval_stable_rank.py b/training/eval_stable_rank.py
+index d5de8c5..a27ab02 100644
+--- a/training/eval_stable_rank.py
++++ b/training/eval_stable_rank.py
+@@ -56,9 +56,12 @@ def load_sl_weak(weak_dir, device='cpu'):
+ 
+ 
+ class SLWeakAgent:
+-    def __init__(self, weak_dir, device='cpu'):
++    def __init__(self, weak_dir, device='cpu', sample=False):
+         self.models = load_sl_weak(weak_dir, device)
+         self.device = device
++        # [DIAG] True : les adversaires SL echantillonnent (comme a
++        # l'entrainement --opponent-mode sample) au lieu de l'argmax.
++        self.sample = sample
+         self.frozen = {h: self.models[h] for h in
+                         ['riichi', 'chow', 'pong', 'kong']}
+ 
+@@ -72,6 +75,9 @@ class SLWeakAgent:
+         with torch.no_grad():
+             logits = self.models['discard'](on)
+             masked = logits + (mask_t - 1.0) * 1e9
++            if self.sample:
++                probs = torch.softmax(masked, dim=-1)
++                return int(torch.multinomial(probs, 1).item())
+         return int(masked.argmax(dim=-1).item())
+ 
+ class RLAgent:
+@@ -125,7 +131,7 @@ class RLAgent:
+ # ====================================================================== #
+ def eval_worker(worker_id, n_games, agent_checkpoint, sl_discard,
+                  sl_frozen, weak_dir, device='cpu', seed=0, sample=False,
+-                 worker_offset=0, oracle_gamma=0.0):
++                 worker_offset=0, oracle_gamma=0.0, weak_sample=False):
+     """Chaque worker : charge ses propres modeles (thread-safe car process).
+ 
+     Retourne (n1, n2, n3, n4) sur n_games parties.
+@@ -142,7 +148,7 @@ def eval_worker(worker_id, n_games, agent_checkpoint, sl_discard,
+     torch.manual_seed(seed + worker_id)
+     rl_agent = RLAgent(agent_checkpoint, sl_discard, sl_frozen, device,
+                        sample=sample, oracle_gamma=oracle_gamma)
+-    weak = SLWeakAgent(weak_dir, device)
++    weak = SLWeakAgent(weak_dir, device, sample=weak_sample)
+     print(f"[worker {worker_id}] modeles charges en "
+           f"{time.time()-t_load:.1f}s (threads={threads})", flush=True)
+ 
+@@ -255,7 +261,8 @@ def evaluate(args):
+             continue
+         tasks.append((i, splits[i], args.agent_checkpoint, args.sl_discard,
+                        args.sl_frozen, args.weak_dir, device, args.seed,
+-                       args.sample, sum(splits[:i]), args.oracle_gamma))
++                       args.sample, sum(splits[:i]), args.oracle_gamma,
++                       args.weak_sample))
+ 
+     print(f"[eval] lancement de {len(tasks)} workers...", flush=True)
+ 
+@@ -289,6 +296,8 @@ def evaluate(args):
+     print(f"  Stable rank (Tenhou) : {sr:.4f}  IC95 [{sr_lo:.2f}, {sr_hi:.2f}]")
+     print(f"  Oracle (gamma)       : {args.oracle_gamma} "
+           f"(0 = deploiement, 1 = oracle complet)")
++    print(f"  Adversaires SL       : "
++          f"{'echantillonnes' if args.weak_sample else 'argmax'}")
+     print(f"  Mode joueur eval     : "
+           f"{'echantillonne' if args.sample else 'argmax'}, sieges alternes")
+     if total < 1000:
+@@ -315,6 +324,9 @@ def main():
+     p.add_argument('--oracle-gamma', type=float, default=0.0,
+                    help='[DIAG] proportion d oracle visible pour le RL : '
+                         '0 = deploiement (defaut), 1 = oracle complet')
++    p.add_argument('--weak-sample', action='store_true',
++                   help='[DIAG] les 3 adversaires SL echantillonnent '
++                        "(au lieu de l'argmax)")
+     args = p.parse_args()
+     evaluate(args)
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,223 @@
+diff --git a/agents/oracle_agent.py b/agents/oracle_agent.py
+index beab9d5..2f60ed5 100644
+--- a/agents/oracle_agent.py
++++ b/agents/oracle_agent.py
+@@ -9,6 +9,7 @@ Conforme au papier §3.3 (oracle guiding) :
+ Une fois γ=0, l'agent devient "normal" (250 canaux effectifs, les 136
+ autres à zéro). C'est ce qui permet de déployer l'agent sans info parfaite.
+ """
++import copy
+ import numpy as np
+ import torch
+ import torch.nn as nn
+@@ -61,6 +62,18 @@ class OracleDiscardAgent:
+               f"(val_acc={ck.get('val_acc','?')}, "
+               f"arch={channels}x{n_blocks})", flush=True)
+ 
++        # [ANCRE KL] Copie GELEE de la policy SL de depart. Sert de
++        # reference pour la penalite KL(pi || pi_SL) : sans ancrage le
++        # self-play symetrique derive vers des politiques passives (run
++        # 15M : 38 pourcent d'exhaustive draws, rang moyen 2.68 vs 2.50
++        # pour le SL). Construite ICI (depuis le SL), donc inchangee par un
++        # --resume qui ne charge que les poids de self.policy.
++        self.ref_policy = copy.deepcopy(self.policy).eval()
++        for _p in self.ref_policy.parameters():
++            _p.requires_grad = False
++        self.compute_kl = False       # active par la boucle (--kl-coef > 0)
++        self.last_kl = None
++
+         # --- Critic ---
+         self.critic = Critic().to(device)
+ 
+@@ -232,7 +245,19 @@ class OracleDiscardAgent:
+         log_probs = torch.log_softmax(masked_logits, dim=-1)
+         probs = torch.exp(log_probs)
+         entropy = -(probs * log_probs).sum(dim=-1)
+-        
++
++        # [ANCRE KL] KL(pi || pi_SL) moyenne sur les etats du batch, avec
++        # gradient vers pi. Stockee dans self.last_kl (la signature de
++        # retour est inchangee). Memes etats et memes masques que pi.
++        if self.compute_kl:
++            with torch.no_grad():
++                ref_logits = self.ref_policy(x) + (mask_t - 1.0) * 1e9
++                ref_log_probs = torch.log_softmax(ref_logits, dim=-1)
++            self.last_kl = (probs * (log_probs - ref_log_probs)
++                            ).sum(dim=-1).mean()
++        else:
++            self.last_kl = None
++
+         return logp, values.squeeze(-1), entropy
+ 
+     # ------------------------------------------------------------------ #
+diff --git a/training/eval_checkpoints.py b/training/eval_checkpoints.py
+new file mode 100644
+index 0000000..0af0b91
+--- /dev/null
++++ b/training/eval_checkpoints.py
+@@ -0,0 +1,70 @@
++"""
++eval_checkpoints.py -- Evalue plusieurs checkpoints RL (jalons) contre le SL
++et designe le meilleur (rang moyen le plus bas).
++
++Usage :
++    py -3.14 -m mahjong_ai.training.eval_checkpoints ^
++        --checkpoints checkpoints\\rl_tonpusen_v2\\*_milestone*.pt ^
++        --sl-discard <discard SL> --sl-frozen <dossier tetes SL> ^
++        --weak-dir <dossier SL-weak> --n-games 1000 --n-workers 4
++
++Chaque checkpoint = n-games parties (20+ min pour 1000). Ordre croissant de
++step : on voit OU la courbe se degrade. Reprendre/exporter le meilleur,
++pas forcement le dernier.
++"""
++import argparse
++import glob
++import multiprocessing as mp
++import re
++from types import SimpleNamespace
++
++from mahjong_ai.training.eval_stable_rank import evaluate
++
++
++def _step_of(path):
++    m = re.search(r'(?:step|milestone)(\d+)', path)
++    return int(m.group(1)) if m else -1
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument('--checkpoints', nargs='+', required=True,
++                   help='chemins ou motifs glob')
++    p.add_argument('--sl-discard', required=True)
++    p.add_argument('--sl-frozen', required=True)
++    p.add_argument('--weak-dir', required=True)
++    p.add_argument('--n-games', type=int, default=1000)
++    p.add_argument('--n-workers', type=int, default=4)
++    p.add_argument('--seed', type=int, default=42)
++    p.add_argument('--sample', action='store_true')
++    a = p.parse_args()
++
++    paths = []
++    for pat in a.checkpoints:
++        paths += glob.glob(pat) or [pat]
++    paths = sorted(set(paths), key=_step_of)
++    if not paths:
++        raise SystemExit("aucun checkpoint trouve")
++
++    rows = []
++    for path in paths:
++        print(f"\n##### {path}", flush=True)
++        r = evaluate(SimpleNamespace(
++            agent_checkpoint=path, sl_discard=a.sl_discard,
++            sl_frozen=a.sl_frozen, weak_dir=a.weak_dir,
++            n_games=a.n_games, n_workers=a.n_workers, seed=a.seed,
++            sample=a.sample))
++        rows.append((path, r))
++
++    print("\n=== RECAPITULATIF (rang moyen, bas = mieux ; 2.500 = egal) ===")
++    for path, r in rows:
++        print(f"  step {_step_of(path):>10d}  rang={r['mean_rank']:.3f} "
++              f"+-{r['mean_rank_ci']:.3f}  stable={r['stable_rank']:.2f}  "
++              f"{path}")
++    best = min(rows, key=lambda x: x[1]['mean_rank'])
++    print(f"\nMeilleur : {best[0]} (rang {best[1]['mean_rank']:.3f})")
++
++
++if __name__ == '__main__':
++    mp.freeze_support()
++    main()
+diff --git a/training/eval_stable_rank.py b/training/eval_stable_rank.py
+index 3dfd26d..a99f784 100644
+--- a/training/eval_stable_rank.py
++++ b/training/eval_stable_rank.py
+@@ -288,6 +288,8 @@ def evaluate(args):
+         print(f"  !! {total} parties : trop peu pour conclure "
+               f"(viser >= 1000, IC ci-dessus).")
+     print(f"  Duree     : {elapsed:.1f}s ({total/elapsed:.2f} games/s)")
++    return {'n': (n1, n2, n3, n4), 'mean_rank': mr, 'mean_rank_ci': mr_ci,
++            'stable_rank': sr, 'sr_ci': (sr_lo, sr_hi)}
+ 
+ 
+ def main():
+diff --git a/training/train_rl_suphx.py b/training/train_rl_suphx.py
+index 5e9d2e1..dc923dc 100644
+--- a/training/train_rl_suphx.py
++++ b/training/train_rl_suphx.py
+@@ -540,6 +540,12 @@ def train(args):
+     current_phase, _, _ = get_phase_and_gamma(
+         step, args.total_steps, args.oracle_frac, args.transition_frac)
+     base_lr = args.lr
++    agent.compute_kl = args.kl_coef > 0
++    print(f"[train_rl] ancre KL vers le SL : coef={args.kl_coef} "
++          f"({'ON' if agent.compute_kl else 'OFF'}) ; checkpoints jalons "
++          f"tous les {args.milestone_every} steps", flush=True)
++    last_milestone = start_step // args.milestone_every \
++        if args.milestone_every > 0 else 0
+     # [FIX LR-RESUME] Les facteurs de LR n'etaient appliques qu'au CHANGEMENT
+     # de phase : un resume directement en phase 2/3 gardait le LR plein.
+     # L'optimizer n'est pas sauvegarde -> on applique le facteur ici.
+@@ -649,6 +655,7 @@ def train(args):
+ 
+             entropy_first = None
+             ratio_dev_first = None
++            kl_last = None
+             for epoch_i in range(PPO_EPOCHS):
+                 agent.policy_optim.zero_grad()
+                 agent.critic_optim.zero_grad()
+@@ -662,6 +669,10 @@ def train(args):
+                     entropy_first = entropy.item()
+                     ratio_dev_first = getattr(agent, 'last_ratio_dev', None)
+                 loss = policy_loss + args.value_coef * value_loss - alpha * entropy
++                kl_t = getattr(agent, 'last_kl', None)
++                if args.kl_coef > 0 and kl_t is not None:
++                    loss = loss + args.kl_coef * kl_t
++                    kl_last = float(kl_t.detach().item())
+                 loss.backward()
+                 policy_gnorm_last = torch.nn.utils.clip_grad_norm_(
+                     agent.policy.parameters(), 5.0)
+@@ -744,6 +755,7 @@ def train(args):
+                 alerts = check_drift_alerts(metrics, phase)
+                 rdev_str = (f"{ratio_dev_first:.3f}"
+                             if ratio_dev_first is not None else "n/a")
++                kl_str = f"{kl_last:.4f}" if kl_last is not None else "off"
+ 
+                 print(f"[step {step:7d} | phase {phase}] "
+                       f"pl={policy_loss.item():+.4f} "
+@@ -751,6 +763,7 @@ def train(args):
+                       f"H={entropy.item():.4f} "
+                       f"alpha={alpha:.4f} "
+                       f"rdev={rdev_str} "
++                      f"kl={kl_str} "
+                       f"gamma={gamma_t:.3f} "
+                       f"buf={current_buf}{mem_info} "
+                       f"({elapsed:.0f}s)", flush=True)
+@@ -802,6 +815,15 @@ def train(args):
+                 agent.save(latest_path, step=step, alpha=alpha)
+                 if args.keep_last_n > 0:
+                     _purge_old_checkpoints(base_out, args.keep_last_n)
++                # [JALONS] checkpoints JAMAIS purges, pour evaluer plus tard
++                # (eval_checkpoints.py) et reprendre le meilleur : le dernier
++                # n'est pas forcement le meilleur.
++                if (args.milestone_every > 0
++                        and step // args.milestone_every > last_milestone):
++                    last_milestone = step // args.milestone_every
++                    ms_path = f"{base_out}_milestone{step:09d}.pt"
++                    agent.save(ms_path, step=step, alpha=alpha)
++                    print(f"[step {step}] jalon {ms_path}", flush=True)
+                 print(f"[step {step}] save {step_path} + {latest_path}",
+                       flush=True)
+ 
+@@ -913,6 +935,13 @@ def main():
+ 
+     p.add_argument('--iw-threshold', type=float, default=5.0)
+     p.add_argument('--keep-last-n', type=int, default=0)
++    p.add_argument('--kl-coef', type=float, default=0.05,
++                   help='[ANCRE] poids de KL(pi || pi_SL) dans la loss. '
++                        '0 = desactive. Plage utile 0.02-0.2 : trop bas -> '
++                        'derive passive ; trop haut -> reste colle au SL.')
++    p.add_argument('--milestone-every', type=int, default=1000000,
++                   help='un checkpoint *_milestoneN.pt jamais purge tous '
++                        'les N steps (0 = desactive)')
+ 
+     p.add_argument('--publish-every', type=int, default=2000)
+     p.add_argument('--save-every', type=int, default=50000)

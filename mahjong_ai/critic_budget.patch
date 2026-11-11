@@ -1,0 +1,66 @@
+diff --git a/training/train_rl_suphx.py b/training/train_rl_suphx.py
+index 0b56f17..99ec97c
+--- a/training/train_rl_suphx.py
++++ b/training/train_rl_suphx.py
+@@ -747,6 +747,42 @@ def train(args):
+                           else 'batch_mean'),
+                 reward_scale=args.reward_scale, min_ev=args.min_ev)
+ 
++            # [FIX CRITIC BUDGET] Le compteur de steps compte des
++            # TRANSITIONS consommees, pas des mises a jour : 2000 steps
++            # = 2 updates x 3 epochs = 6 pas de gradient au total. V8
++            # n'a donne que ~800 pas de gradient au critic en 228k
++            # steps (dont ~300 pendant tout le warmup 50k) : budget
++            # ~100x trop petit pour apprendre V(s) (val_std ~ 0,
++            # FLAT_VALUE permanent). Inner loop : K pas supplementaires
++            # par update, en minibatch aleatoire pour limiter l'overfit
++            # des ~60-100 cibles distinctes du batch. Les avantages ont
++            # deja ete calcules ci-dessus : cette boucle n'affecte pas
++            # la policy, elle enrichit seulement le critic.
++            if critic_mode and args.critic_inner_steps > 0:
++                on_all = torch.as_tensor(
++                    np.stack([t['obs_normal'] for t in batch]),
++                    dtype=torch.float32, device=agent.device)
++                oo_all = torch.as_tensor(
++                    np.stack([t.get('obs_oracle_full', t['obs_oracle'])
++                              for t in batch]),
++                    dtype=torch.float32, device=agent.device)
++                ret_all = torch.as_tensor(
++                    [t['return'] for t in batch],
++                    dtype=torch.float32, device=agent.device
++                ) / args.reward_scale
++                mb = min(256, len(batch))
++                for _ in range(args.critic_inner_steps):
++                    sel = torch.randint(0, len(batch), (mb,),
++                                        device=agent.device)
++                    agent.critic_optim.zero_grad()
++                    v = agent.critic(
++                        torch.cat([on_all[sel], oo_all[sel]], dim=1))
++                    vloss = ((v - ret_all[sel]) ** 2).mean()
++                    vloss.backward()
++                    torch.nn.utils.clip_grad_norm_(
++                        agent.critic.parameters(), 5.0)
++                    agent.critic_optim.step()
++
+             # Multi-epoch PPO : plusieurs passes de gradient par batch
+             PPO_EPOCHS = args.ppo_epochs
+             policy_loss_last = None
+@@ -1026,7 +1062,17 @@ def main():
+     p.add_argument('--max-batch-transitions', type=int, default=1000)
+ 
+     p.add_argument('--lr', type=float, default=1e-4)
+-    p.add_argument('--critic-lr', type=float, default=3e-3)
++    # [FIX CRITIC BUDGET] 3e-3 rendait l'Adam du critic instable : il
++    # trouvait un bon V(s) puis divergeait et le perdait (signature v8 :
++    # EV +0.012 -> 0.000 en oscillation, val_std 0.13 -> 0.00).
++    # Stable a 1e-3 (verifie sur cible synthetique).
++    p.add_argument('--critic-lr', type=float, default=1e-3)
++    # [FIX CRITIC BUDGET] pas de gradient SUPPLEMENTAIRES du critic par
++    # update (minibatch aleatoire de 256). Sans inner loop, le compteur
++    # de steps donne seulement 6 pas de gradient par 2000 steps (2
++    # updates x 3 epochs) : ~800 pas en tout dans v8. 10 -> 13 pas par
++    # update (26 par 2000 steps), ~3300 sur 250k steps. 0 desactive.
++    p.add_argument('--critic-inner-steps', type=int, default=10)
+     p.add_argument('--gamma', type=float, default=0.99)
+     p.add_argument('--lam', type=float, default=0.95)
+     p.add_argument('--clip-eps', type=float, default=0.2)

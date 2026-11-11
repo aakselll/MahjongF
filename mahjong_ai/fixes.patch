@@ -1,0 +1,215 @@
+--- download/mahjong_ai_rl_rework/training/game_env.py	2026-11-05 20:43:01.000000000 +0000
++++ mahjong_ai/training/game_env.py	2026-11-06 08:37:41.187844187 +0000
+@@ -5,8 +5,13 @@
+ [MODIF 2026-10-13] Suppression des flags de format des features GRP.
+ rounds_remaining absolu (normalise /8) remplace la progression relative.
+ 
+-[TONPUUSEN ONLY] Le modele est entraine sur des parties East-only
+-(4 manches max, sans enchousen active en pratique).
++[TONPUUSEN + ENCHOUSEN] Parties East-only avec extension Sud (regle
++Mahjong Soul 东风战南入) : si personne n'a 30 000 pts a la fin d'East 4,
++la partie continue en Sud 1-4 en mort subite jusqu'a ce qu'un joueur
++atteigne 30 000 pts ; a la fin de Sud 4 sans franchissement, le joueur
++avec le plus de points gagne (cf. _check_game_end, regles 4-6).
++Les modeles SL sont entraînés sur des logs tonpusen (4 manches le plus
++souvent), l'extension reste donc rare dans les donnees d'entraînement.
+ 
+ Regles implementees :
+ - Renchan, Honba (illimite)
+@@ -14,7 +19,10 @@
+ - Agari Yame : all last + dealer 1er + gagne -> fin
+ - Tenpai Yame : all last + dealer 1er + tenpai sur ryuukyoku -> fin
+ - Oorasu : fin East 4 si quelqu'un >= 30k
+-- Enchousen (Sud 1-4) : implemente mais DESACTIVE en pratique
++- Enchousen (Sud 1-4) : APPLIQUE -- personne >= 30k a la fin d'East 4
++  -> extension Sud en mort subite ; fin des qu'un joueur atteint 30k
++  (agari OU paiements de noten), sinon reglement force a la fin de Sud 4
++  (le plus haut score gagne)
+ """
+ import numpy as np
+ from mahjong_ai.envs.multi_agent import MultiAgentMahjongEnv, REWARD_SCALE
+@@ -80,6 +88,9 @@
+             seed=seed, compute_lookahead=compute_lookahead)
+         self.predictor_holder = predictor_holder or PredictorHolder()
+         self.game_log_buffer = game_log_buffer
++        # [NOTE] n_rounds est INERTE : la progression des manches suit les
++        # constantes N_ROUNDS_NORMAL (East 1-4) / N_ROUNDS_MAX (Sud 4 cap
++        # enchousen) / MAX_KYOKU (securite). Param conserve pour compat.
+         self.n_rounds = n_rounds
+         self.game_format = game_format or "tonpuu"
+         self._reset_game_state()
+@@ -153,8 +164,17 @@
+                 except Exception:
+                     pass
+ 
+-        # 4. Enchousen : agari qui porte un joueur a 30k+
+-        if self.is_enchousen and outcome in ("tsumo", "ron", "multi_ron"):
++        # 4. Enchousen : mort subite -- un joueur atteint 30k.
++        # [FIX 2026-11] le franchissement compte pour TOUTE fin de manche
++        # ou des points sont marques (agari, ou paiements de noten sur
++        # ryuukyoku) : regle MJSoul "加时赛中一旦有玩家超过30000点即立刻
++        # 结束游戏" (des qu'un joueur depasse 30k, la partie s'arrete
++        # immediatement). Les manches abortives ne changent aucun score,
++        # le test serait de toute facon negatif. Avant ce fix, seul l'agari
++        # etait verifie : un joueur pousse au-dela de 30k grace aux
++        # paiements de noten et la partie continuait (faux).
++        if self.is_enchousen and outcome in (
++                "tsumo", "ron", "multi_ron", "exhaustive"):
+             if any(s >= TARGET_SCORE for s in self.game_scores):
+                 return True, "enchousen_30k"
+ 
+--- download/mahjong_ai_rl_rework/test_red_fives.py	2026-11-05 20:43:01.000000000 +0000
++++ mahjong_ai/test_red_fives.py	2026-11-06 08:31:04.526307538 +0000
+@@ -284,20 +284,48 @@
+     check("apres le ron potentiel : etat restaure (pas de rouge fantome)",
+           not env.red_hand[0][1] and env.hands[0][13] == 1)
+ # melds avec rouge
++# [FIX 2026-11] l'ancien bloc construisait une main fermee de 14 tuiles
++# PLUS un pon (17 tuiles pour shanten_of) : etat impossible en partie
++# reelle (13 - 3 meld + 1 tuile de victoire = 11 fermees), et la vraie
++# lib mahjong refuse > 14 tuiles ("Too many tiles = 17") -- le stub ne
++# validait pas le compte, d'ou l'echec seulement avec la vraie lib.
++# Main valide : 234m 456m (5m ROUGE) 55p 234s fermees (11) + pon 5s
++# (rouge dans le meld), tsumo sur 5p -> tanyao ouvert (MJSoul : 食断).
++# NB : _discard_count[0] = 1 pour eviter le heuristique "premiere tuile"
++# (is_tenhou) qui, avec un meld ouvert, fait refuser la main par la
++# vraie lib (tenhou_with_meld_not_allowed).
+ env.hands[0][:] = 0
+-for t in (0, 1, 2, 3, 4, 5, 6, 7, 8):
+-    env.hands[0][t] = 1
+-env.hands[0][19] = 1; env.hands[0][20] = 1; env.hands[0][21] = 1
+-env.hands[0][27] = 2
++for t in (1, 2, 3, 3, 4, 5, 19, 20, 21):    # 234m 456m 234s
++    env.hands[0][t] += 1
++env.hands[0][13] = 2                          # paire de 5p (normaux)
+ env.melds[0] = [{"type": "pon", "tiles": [22, 22, 22], "reds": [2]}]
+ env.red_hand[0][:] = False
+-env.hands[0][4] = 1
+-env.red_hand[0][0] = True
++env.red_hand[0][0] = True                     # le 5m de la main est le rouge
++env._discard_count[0] = 1                     # pas un "premier tirage"
+ _StubCalc.LAST = None
+-env._evaluate_hand(0, 27, is_tsumo=True, already_in_hand=True)
+-if _StubCalc.LAST is not None:
++env._evaluate_hand(0, 13, is_tsumo=True, already_in_hand=True)
++rec = _StubCalc.LAST
++if rec is None:
++    # vraie lib : verification directe du han, rouge par rouge
++    # (un aka dora = +1 han, cf. regle MJSoul 赤宝牌)
++    res_red = env._evaluate_hand(0, 13, is_tsumo=True, already_in_hand=True)
++    assert res_red is not None and res_red.error is None, \
++        f"main refusee : {getattr(res_red, 'error', 'None')}"
++    env.red_hand[0][0] = False                # plus de rouge en main
++    res_half = env._evaluate_hand(0, 13, is_tsumo=True, already_in_hand=True)
++    env.melds[0][0]["reds"] = []              # plus de rouge dans le pon
++    res_none = env._evaluate_hand(0, 13, is_tsumo=True, already_in_hand=True)
++    env.red_hand[0][0] = True                 # restauration
++    env.melds[0][0]["reds"] = [2]
++    check("vraie lib : le 5m rouge en main vaut +1 han (aka dora)",
++          res_red.han == res_half.han + 1, (res_red.han, res_half.han))
++    check("vraie lib : le 5s rouge du pon vaut +1 han (aka dora)",
++          res_half.han == res_none.han + 1, (res_half.han, res_none.han))
++    check("vraie lib : les 2 rouges ensemble = +2 han",
++          res_red.han == res_none.han + 2, (res_red.han, res_none.han))
++else:
+     check("meld pon de 5s (rouge) + 5m rouge en main : 2 aka",
+-          _StubCalc.LAST["aka"] == 2, _StubCalc.LAST)
++          rec["aka"] == 2, rec)
+ 
+ # --- C3. defausse / appels ----------------------------------------------
+ env = MultiAgentMahjongEnv(seed=1, compute_lookahead=False)
+--- download/mahjong_ai_rl_rework/test_end_rules.py	2026-11-05 20:43:01.000000000 +0000
++++ mahjong_ai/test_end_rules.py	2026-11-06 08:32:08.602549816 +0000
+@@ -108,13 +108,13 @@
+     check("East 4, dealer 1er, exhaustive (pas agari)",
+           env, 'exhaustive', 0.0, True, "oorasu")
+ 
+-    # East 4, dealer 2eme, gagne -> pas agari yame (dealer pas 1er)
+-    # Scores [15, 10, ...] : p1=1er, dealer=0 -> dealer est 2eme
+-    # Mais attention : dealer=0, scores[0]=15, scores[1]=10 -> p0 est 1er !
+-    # Donc pour mettre dealer en 2eme : scores[0] < scores[1]
+-    env = new_env(); env.game_scores = [5.0, 15.0, 0.0, -5.0]  # p1=1er
++    # East 4, dealer 2eme, gagne -> pas de fin (personne >= 30k)
++    # [FIX 2026-11] scores [5, 15, ...] = 40k pour p1 -> oorasu legitime
++    # (convention : 0.0 = 25 000 pts, TARGET_SCORE 5.0 = 30 000 pts).
++    # Ici p1 = 29.5k (1er), dealer p0 = 29k (2eme) : personne a 30k.
++    env = new_env(); env.game_scores = [4.0, 4.5, 0.0, -5.0]  # p1=1er
+     env.round_num = 4; env.is_enchousen = False
+-    check("East 4, dealer 2eme, gagne (pas agari yame)",
++    check("East 4, dealer 2eme, gagne, personne 30k (enchousen)",
+           env, 'tsumo', 1.5, False, None, dealer_real=0)
+ 
+     # East 3 (pas all last) -> pas agari yame
+@@ -161,11 +161,11 @@
+     check("East 4, dealer 1er, outcome=tsumo mais reward=0",
+           env, 'tsumo', 0.0, True, "oorasu", tenpai=True)
+ 
+-    # Dealer 2eme tenpai -> pas de tenpai yame
+-    # Scores [5, 15, ...] : p1=1er
+-    env = new_env(); env.game_scores = [5.0, 15.0, 0.0, -5.0]
++    # Dealer 2eme tenpai -> pas de tenpai yame, personne >= 30k -> enchousen
++    # [FIX 2026-11] memes scores corriges (p1 = 29.5k < 30k)
++    env = new_env(); env.game_scores = [4.0, 4.5, 0.0, -5.0]  # p1=1er
+     env.round_num = 4; env.is_enchousen = False
+-    check("East 4, dealer 2eme, tenpai sur exhaustive",
++    check("East 4, dealer 2eme, tenpai, personne 30k (enchousen)",
+           env, 'exhaustive', 0.0, False, None, tenpai=True)
+ 
+ 
+@@ -214,11 +214,21 @@
+     check("Sud 2, agari, qqun >= 30k", env, 'tsumo', 1.0,
+           True, "enchousen_30k")
+ 
+-    env = new_env(); env.game_scores = [5.0, 8.0, 2.0, -2.0]
++    env = new_env(); env.game_scores = [4.9, 4.5, 2.0, -2.0]  # max 29.9k
+     env.round_num = 6; env.is_enchousen = True
+-    check("Sud 2, ryuukyoku, qqun >= 30k (continue)",
++    check("Sud 2, ryuukyoku SANS passage de 30k (continue)",
+           env, 'exhaustive', 0.0, False, None)
+ 
++    # [FIX 2026-11] paiement de noten qui fait franchir 30k en extension :
++    # regle MJSoul "加时赛中一旦有玩家超过30000点即立刻结束游戏" -- le
++    # franchissement compte QUELLE QUE SOIT la facon de marquer (agari
++    # OU paiements de noten sur ryuukyoku). L'ancien code ne verifiait
++    # que les agari.
++    env = new_env(); env.game_scores = [5.2, 8.0, 2.0, -2.0]
++    env.round_num = 6; env.is_enchousen = True
++    check("Sud 2, ryuukyoku, noten fait franchir 30k (fin)",
++          env, 'exhaustive', 0.0, True, "enchousen_30k")
++
+     env = new_env(); env.game_scores = [3.0, 2.0, 0.0, -5.0]
+     env.round_num = 6; env.is_enchousen = True
+     check("Sud 2, agari, personne >= 30k (continue)",
+@@ -244,7 +254,10 @@
+     # Sud 4, !repeat, dealer 2eme -> enchousen_max
+     # Scores [5, 3, 2, 0] : p0=1er... attends, dealer=0 est 1er !
+     # Pour eviter agari yame, il faut outcome=exhaustive et pas tenpai
+-    env = new_env(); env.game_scores = [5.0, 3.0, 2.0, 0.0]
++    # [FIX 2026-11] scores [5, ...] = 30k pile -> enchousen_30k legitime
++    # avec le fix regle 4 (le check 30k s'applique aussi au ryuukyoku).
++    # Pour tester enchousen_max SANS franchissement : max < 30k.
++    env = new_env(); env.game_scores = [4.0, 3.0, 2.0, 0.0]  # max 29k
+     env.round_num = 8; env.is_enchousen = True
+     check("Sud 4, no repeat, exhaustive",
+           env, 'exhaustive', 0.0, True, "enchousen_max",
+@@ -258,7 +271,8 @@
+           dealer_repeats=True, dealer_real=0)
+ 
+     # Sud 4, dealer 2eme repeat -> continue
+-    env = new_env(); env.game_scores = [3.0, 5.0, 2.0, 0.0]  # p1=1er
++    # [FIX 2026-11] memes scores < 30k (p1 = 29k, 1er ; dealer p0 2eme)
++    env = new_env(); env.game_scores = [3.0, 4.0, 2.0, 0.0]  # p1=1er
+     env.round_num = 8; env.is_enchousen = True
+     check("Sud 4, dealer 2eme repeat (continue)",
+           env, 'exhaustive', 0.0, False, None,
+@@ -271,7 +285,9 @@
+ def test_max_kyoku():
+     section("7. MAX_KYOKU (securite anti-boucle)")
+ 
+-    env = new_env(); env.game_scores = [5.0, 3.0, 2.0, 0.0]
++    # [FIX 2026-11] scores < 30k pour atteindre la limite sans declencher
++    # enchousen_30k avant max_kyoku.
++    env = new_env(); env.game_scores = [4.0, 3.0, 2.0, 0.0]  # max 29k
+     env.round_num = 5; env.is_enchousen = True
+     env.kyoku_count = MAX_KYOKU - 1
+     check("kyoku_count atteint la limite",

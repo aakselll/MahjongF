@@ -1,0 +1,126 @@
+diff --git a/envs/multi_agent.py b/envs/multi_agent.py
+index 1292c92..54131ba 100644
+--- a/envs/multi_agent.py
++++ b/envs/multi_agent.py
+@@ -103,6 +103,7 @@ class MultiAgentMahjongEnv:
+         self.melds = None
+         self.discards = None
+         self.use_red = USE_RED_FIVES
++        self.river_all = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
+         self._clear_reds()
+         self._compute_lookahead = compute_lookahead
+         self.wall = None
+@@ -219,6 +220,10 @@ class MultiAgentMahjongEnv:
+         self.melds = [[] for _ in range(4)]
+         self.discards = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
+         self._clear_reds()
++        # [FIX FURITEN] defausses COMPLETES (tuiles prises par chi/pon/kan
++        # comprises) : `discards` les retire (feature), mais le furiten
++        # permanent doit les compter.
++        self.river_all = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
+         self.riichi = [False, False, False, False]
+         # [FIX BATONS RIICHI] on repart des batons reportes (0 par defaut).
+         self.riichi_deposits = int(self.ctx.get("kyoutaku", 0))
+@@ -594,7 +599,7 @@ class MultiAgentMahjongEnv:
+         if shanten_of(base_counts.tolist()) != 0:
+             return False
+         for t in range(N_TILES):
+-            if self.discards[seat][t] > 0:
++            if max(self.discards[seat][t], self.river_all[seat][t]) > 0:
+                 trial = base_counts.copy()
+                 trial[t] += 1
+                 if shanten_of(trial.tolist()) == -1:
+@@ -1108,6 +1113,7 @@ class MultiAgentMahjongEnv:
+                 action = tile
+                 self.hands[seat][action] -= 1
+                 self.discards[seat][action] += 1
++                self.river_all[seat][action] += 1
+                 # [ROUGES] tsumogiri force en riichi : si la tuile piochee
+                 # est le rouge, c'est lui qui part.
+                 self._after_discard(seat, action, tsumogiri_red=self._drawn_red)
+@@ -1128,6 +1134,7 @@ class MultiAgentMahjongEnv:
+                 shanten_before = shanten_of(self._shanten_counts(seat).tolist())
+                 self.hands[seat][action] -= 1
+                 self.discards[seat][action] += 1
++                self.river_all[seat][action] += 1
+                 self._after_discard(seat, action)
+                 shanten_after = shanten_of(self._shanten_counts(seat).tolist())
+                 pending = (shanten_discard_coef *
+diff --git a/sl/mjai_parser.py b/sl/mjai_parser.py
+index 93e739d..ddf54c4 100644
+--- a/sl/mjai_parser.py
++++ b/sl/mjai_parser.py
+@@ -163,6 +163,9 @@ class GameState:
+         self.hands = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
+         self.melds = [[] for _ in range(4)]
+         self.discards = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
++        # [FIX FURITEN] defausses completes (tuiles prises par chi/pon/kan
++        # comprises) : `discards` les retire, le furiten doit les compter.
++        self.river_all = [np.zeros(N_TILES, dtype=np.int32) for _ in range(4)]
+         self.discard_history = [[] for _ in range(4)]
+         self.riichi = [False, False, False, False]
+         self.dora_indicators = []
+@@ -230,7 +233,7 @@ def _pov_furiten(state, pov):
+     except Exception:
+         return False
+     for t in range(N_TILES):
+-        if state.discards[pov][t] > 0:
++        if state.river_all[pov][t] > 0:
+             trial = counts.copy()
+             trial[t] += 1
+             try:
+@@ -358,7 +361,7 @@ def _compute_pending_calls(state, discarder, tile):
+         try:
+             trial = state.get_shanten_counts(s).copy().astype(np.int32)
+             trial[tile] += 1
+-            if shanten_of(trial.tolist()) == -1 and state.discards[s][tile] == 0:
++            if shanten_of(trial.tolist()) == -1 and state.river_all[s][tile] == 0:
+                 calls["ron"] = True
+         except Exception:
+             pass
+@@ -496,6 +499,7 @@ def events_to_samples(events, pov=0):
+             if actor is not None and tile >= 0:
+                 state.hands[actor][tile] -= 1
+                 state.discards[actor][tile] += 1
++                state.river_all[actor][tile] += 1
+                 k_red = mjai_red_index(ev.get("pai"))
+                 state.last_dahai_red = k_red
+                 if k_red >= 0:
+diff --git a/test_red_fives.py b/test_red_fives.py
+index 887a574..445b0cf 100644
+--- a/test_red_fives.py
++++ b/test_red_fives.py
+@@ -696,6 +696,33 @@ if P is not None:
+     check("kakan : une seule tuile retiree de la main (la tuile ajoutee)",
+           n2m == 1, f"copies de 2m en main = {n2m} (attendu 1)")
+ 
++# ===================================================================== #
++# E. furiten : une tuile defaussee puis prise (chi/pon/kan) compte encore
++# ===================================================================== #
++section("E. furiten et tuiles prises par un adversaire")
++env = MultiAgentMahjongEnv(seed=7, compute_lookahead=False)
++env._deal()
++env._clear_reds()
++env.hands[0][:] = 0
++for t in (1, 2, 3, 13 + 0, 14, 15, 19, 20, 21):      # 234m 456p 234s
++    env.hands[0][t] += 1
++env.hands[0][6] = 2                                    # 77m
++env.hands[0][23] = 1; env.hands[0][24] = 1             # 67s -> attente 5s/8s
++env.melds[0] = []
++env.discards[0][:] = 0
++env._furiten_temp = [False] * 4
++check("tenpai 5s/8s, riviere vide : pas furiten", not env._is_furiten(0))
++env.river_all[0][22] += 1                              # 5s defausse...
++env.discards[0][22] += 1
++env.discards[0][22] -= 1                               # ...puis prise par un pon
++check("5s defausse puis PRISE par un adversaire : toujours furiten",
++      env._is_furiten(0))
++if P is not None:
++    st = P.GameState()
++    st.hands[0][:] = env.hands[0]
++    st.river_all[0][22] = 1                            # defausse, discards[0][22] == 0
++    check("parser SL : meme regle (_pov_furiten)", P._pov_furiten(st, 0))
++
+ # ===================================================================== #
+ failed = [r for r in RESULTS if not r[1]]
+ print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} controles OK")

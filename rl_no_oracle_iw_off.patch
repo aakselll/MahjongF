@@ -1,0 +1,37 @@
+--- a/mahjong_ai/rl/train.py
++++ b/mahjong_ai/rl/train.py
+@@ -193,7 +193,8 @@
+           flush=True)
+     if args.no_oracle:
+         print("[train] NO-ORACLE : gamma=0 des le step 0, multiplicateurs "
+-              "LR forces a 1.0 (policy et critic)", flush=True)
++              "LR forces a 1.0 (policy et critic), filtre IW desactive",
++              flush=True)
+     print(f"[train] mode={args.mode} n_envs={args.n_envs} "
+           f"batch_games={args.batch_games} minibatch={args.minibatch} "
+           f"epochs={args.ppo_epochs} kl_coef={args.kl_coef} "
+@@ -255,8 +256,9 @@
+             entropy_coef=(alpha if args.entropy_mode != 'off' else 0.0),
+             kl_coef=args.kl_coef, grad_clip=args.grad_clip,
+             reward_scale=args.reward_scale,
+-            iw_threshold=(args.iw_threshold if phase == 3
+-                          and args.iw_threshold > 0 else None),
++            iw_threshold=(None if args.no_oracle else (
++                args.iw_threshold if phase == 3
++                and args.iw_threshold > 0 else None)),
+             warmup=warm,
+             lr_policy=args.lr * phase_lr_mult(phase, args.no_oracle)[0],
+             lr_critic=args.critic_lr * phase_lr_mult(
+@@ -422,7 +424,11 @@
+                    default='kaiming')
+     p.add_argument('--oracle-init-scale', type=float, default=0.25)
+     p.add_argument('--iw-threshold', type=float, default=5.0,
+-                   help="IW rejection en phase 3 (0 = off)")
++                   help="IW rejection en phase 3 (0 = off). "
++                        "Correction off-policy du dropout oracle (papier "
++                        "§3.3) : sans oracle (--no-oracle), collection = "
++                        "entraînement, le filtre n'a plus de sens et est "
++                        "automatiquement désactivé.")
+ 
+     # --- PPO ---
+     p.add_argument('--lr', type=float, default=1e-4)
