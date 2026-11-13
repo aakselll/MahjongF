@@ -1,0 +1,652 @@
+diff --git a/mahjong_ai/diag_critic_learnability.py b/mahjong_ai/diag_critic_learnability.py
+old mode 100644
+new mode 100755
+index 2e9c806..d29b930
+--- a/mahjong_ai/diag_critic_learnability.py
++++ b/mahjong_ai/diag_critic_learnability.py
+@@ -1,35 +1,37 @@
+-"""[V2.2] Expérience décisive : le critic peut-il prédire G_t OUT-OF-SAMPLE ?
+-
+-Contexte (run v2.1, checkpoints/rl_v21, 265k steps arrêté) : la fenêtre de
+-replay a réglé « le critic ne voit jamais deux fois les mêmes données » mais
+-produit l'échec inverse — le critic MÉMORISE la fenêtre :
+-    cfit 0.104 -> 0.024 (10x sous le prédicteur-constant ~0.25)
+-    EV sur batch frais : +0.000 -> -0.44 (prédictions confiantes non
+-    corrélées : Var(A) = Var(G) + Var(V))
+-    porte min_ev : 122 rejets sur 122 updates -> batch_mean partout.
+-
+-Cette expérience répond AVANT de relancer un run de 8h :
+-
+-  1. collecte N batches SANS entraînement (policy = SL figée, conditions
+-     du trainer : mode=opponent, gamma_t=0, danger labels) ;
+-  2. split temporel train / val / test — le test n'est JAMAIS vu, il joue
+-     le rôle du « batch frais » que mesure la porte EV du trainer ;
+-  3. pour chaque config (weight_decay x archi) : critic NEUF, entraîné
+-     sur train, époque sélectionnée sur val (early-stop), mesuré sur
+-     test : EV = 1 - Var(G - V)/Var(G), exactement la métrique de la
+-     porte (min_ev=0.02) ;
+-  4. références : prédicteur-constant (EV=0 par construction) et
+-     moyenne-du-train (montre le coût du décalage batch).
+-
+-Verdicts :
+-    EV test >= 0.10  -> relancer le trainer avec --critic-wd <gagnant>
+-    0.02 <= EV < 0.10 -> marginal (la porte passera rarement) ;
+-    EV <= 0.02       -> cible non prédictible par cette archi : NE PAS
+-                        relancer en --adv-mode critic ; rapporter le
+-                        tableau (plan B : entrée features GRP, archi
+-                        différente).
+-
+-Exécution (~1h : collecte ~50 min + ~10 configs x ~30s de fit) :
++"""[V2.3] Le critic peut-il prédire la valeur ? Deuxième salve de sondes.
++
++Verdict v2.2 (expérience précédente, policy SL figée, 20 batches,
++26.5k transitions) : NON-PRÉDICTIBLE out-of-sample. EV test +0.008 au
++mieux (porte min_ev = 0.02), val plate à la bande du prédicteur-constant
++dès le 25e pas, et ce pour les 10 configs wd x archi. Le couple
++architecture (conv 160k params ALÉATOIRES) x données (26k cibles
++distinctes, G_t constant par manche) n'extrait RIEN.
++
++Ce que le verdict v2.2 ne règle PAS (donc reste à mesurer, pas à deviner) :
++
++  SONDE 1 — BACKBONE PRÉ-ENTRAÎNÉ. Le goulet est la richesse des
++  features, pas la taille de la tête : 48k params entraînables sur des
++  features SL (128x6, apprises sur des millions de parties humaines)
++  n'ont pas le même problème que 160k params aléatoires. BackboneCritic
++  = tronc SL figé (canaux normaux, BN en running-stats) + branche oracle
++  entraînable (4 canaux : 3 mains adverses + mur) + tête valeur. Seuls
++  la branche et la tête s'entraînent.
++
++  SONDE 2 — CIBLE r_k (delta de manche) au lieu de G_t. G_t contient la
++  somme escomptée des manches FUTURES : du point de vue de s, c'est du
++  pur bruit (Var(G) ~ 50). Le reward de la manche courante (Var plus
++  faible) est la partie que l'état peut expliquer — la mi-manche, les
++  mains adverses (oracle) et le mur sont visibles.
++
++Grille par défaut : {std, backbone} x {return, reward} x {0, 3e-4} =
++8 fits, quelques minutes chacune sur GPU une fois les données en cache.
++
++CACHE : la collecte (~1 h sur RTX 2060) est la partie chère. Elle est
++sauvegardée en npz (--cache, déf. checkpoints/diag_cache.npz) et
++rechargée telle quelle aux exécutions suivantes — les sondes suivantes
++repartent en quelques minutes, sans re-jeuer un seul env.
++
++Exécution :
+     py -3.14 -m mahjong_ai.diag_critic_learnability \
+         --sl-discard checkpoints/sl_tonpusen_la/discard.pt \
+         --sl-frozen checkpoints/sl_tonpusen_la \
+@@ -43,6 +45,7 @@ import time
+ 
+ import numpy as np
+ import torch
++import torch.nn as nn
+ 
+ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ 
+@@ -51,30 +54,107 @@ from mahjong_ai.rl.rollout import VecRunner
+ from mahjong_ai.agents.oracle_agent import Critic
+ 
+ 
++# ---------------------------------------------------------------------- #
++# Variantes de critic — interface commune forward(obs_n, obs_of) -> (B,)
++# en unités NORMALISÉES (cible = G/10), comme le Critic du trainer.
++# ---------------------------------------------------------------------- #
++class StdCritic(nn.Module):
++    """Adaptateur du Critic standard (référence = config v2.2)."""
++
++    def __init__(self, channels=64, n_blocks=4):
++        super().__init__()
++        self.core = Critic(channels=channels, n_blocks=n_blocks)
++
++    def forward(self, obs_n, obs_of):
++        return self.core(torch.cat([obs_n, obs_of], dim=1))
++
++
++class BackboneCritic(nn.Module):
++    """V(s) sur tronc SL pré-entraîné (FIGÉ) + branche oracle entraînable.
++
++    Tronc : celui du modèle discard SL (128x6, canaux normaux 279) —
++    features apprises sur des millions de parties humaines, BN en
++    running-stats (déterministe). Aucun paramètre du tronc ne bouge.
++
++    Branche oracle : 2 conv (3,1) sur les 4 canaux (3 mains adverses +
++    mur) — le privilège asymétrique, la seule partie qui voit la main
++    des autres. Tête : mean+max pooling des deux voies -> MLP -> 1.
++    Tête finale zero-init : V = 0 exactement au départ (même philosophie
++    que le Critic standard).
++
++    Entraînable : ~50k params (branche + tête). Figé : le tronc SL.
++    """
++
++    def __init__(self, sl_model, branch_ch=32, hidden=128):
++        super().__init__()
++        self.trunk = sl_model.trunk
++        self.trunk.eval()
++        for p in self.trunk.parameters():
++            p.requires_grad_(False)
++        c = self.trunk.input_conv.out_channels
++
++        self.branch = nn.Sequential(
++            nn.Conv2d(4, branch_ch, (3, 1), padding=(1, 0), bias=True),
++            nn.ReLU(inplace=True),
++            nn.Conv2d(branch_ch, branch_ch, (3, 1), padding=(1, 0),
++                      bias=True),
++            nn.ReLU(inplace=True),
++        )
++        self.head = nn.Sequential(
++            nn.Linear(2 * c + 2 * branch_ch, hidden), nn.ReLU(inplace=True),
++            nn.Linear(hidden, 1),
++        )
++        nn.init.zeros_(self.head[-1].weight)
++        nn.init.zeros_(self.head[-1].bias)
++
++    def forward(self, obs_n, obs_of):
++        with torch.no_grad():                       # tronc figé
++            f = self.trunk(obs_n.unsqueeze(-1)).squeeze(-1)   # (B,128,34)
++        g = self.branch(obs_of.unsqueeze(-1)).squeeze(-1)     # (B,32,34)
++        pf = torch.cat([f.mean(-1), f.amax(-1)], dim=1)       # (B,256)
++        pg = torch.cat([g.mean(-1), g.amax(-1)], dim=1)       # (B,64)
++        return self.head(torch.cat([pf, pg], dim=1)).squeeze(-1)
++
++
++def build_model_for(variant, agent, device, seed):
++    """Construit la variante (partie aléatoire reproductible)."""
++    torch.manual_seed(seed)
++    if variant == 'std':
++        m = StdCritic(channels=64, n_blocks=4)
++    elif variant == 'backbone':
++        m = BackboneCritic(agent.sl_discard)
++    else:
++        raise ValueError(variant)
++    return m.to(device).eval()
++
++
+ def build_parser():
+     p = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.
+                                 RawDescriptionHelpFormatter)
+-    # mêmes chemins que rl.train
+     p.add_argument('--sl-discard', required=True)
+     p.add_argument('--sl-frozen', required=True)
+     p.add_argument('--grp-checkpoint', default=None)
+-    # collecte : conditions identiques au trainer
++    # collecte (conditions du trainer)
+     p.add_argument('--n-envs', type=int, default=16)
+     p.add_argument('--batch-games', type=int, default=32)
+-    p.add_argument('--n-batches', type=int, default=20,
+-                   help='total collecté (= 12 train + 4 val + 4 test '
+-                        'par défaut)')
++    p.add_argument('--n-batches', type=int, default=20)
+     p.add_argument('--train-batches', type=int, default=12)
+     p.add_argument('--val-batches', type=int, default=4)
+     p.add_argument('--compute-lookahead', action='store_true')
+     p.add_argument('--seed', type=int, default=0)
+     p.add_argument('--torch-threads', type=int, default=2)
++    p.add_argument('--cache', default='checkpoints/diag_cache.npz',
++                   help='npz de cache des batches collectés. Si le fichier '
++                        'existe : chargé tel quel (collection sautée, '
++                        '~1 h économisée). Sinon : collecte puis save.')
+     # sweep
+-    p.add_argument('--wd-list', type=str, default='0,1e-4,3e-4,1e-3,3e-3')
+-    p.add_argument('--archi-list', type=str, default='64x4,32x2')
+-    p.add_argument('--steps', type=int, default=4000,
+-                   help='budget max par config (early-stop sur val)')
++    p.add_argument('--variants', default='std,backbone')
++    p.add_argument('--targets', default='return,reward',
++                   help="return = G_t (comme le trainer) ; reward = r_k "
++                        "(delta de la manche courante, bruit futur en moins)")
++    p.add_argument('--wd-list', default='0,0.0003')
++    p.add_argument('--steps', type=int, default=4000)
+     p.add_argument('--minibatch', type=int, default=512)
+     p.add_argument('--check-every', type=int, default=25)
+     p.add_argument('--patience', type=int, default=6)
+@@ -84,82 +164,128 @@ def build_parser():
+ 
+ 
+ # ---------------------------------------------------------------------- #
+-def _forward(critic, obs_n, obs_of, device, rs):
+-    """V(s) en unités reward, par tranches."""
++# Cache des batches
++# ---------------------------------------------------------------------- #
++def _batch_from_transitions(trs):
++    return {
++        'obs_n': np.stack([t['obs_normal'] for t in trs]).astype(np.float16),
++        'obs_of': np.stack([t['obs_oracle_full'] for t in trs])
++            .astype(np.float16),
++        'ret': np.array([t['return'] for t in trs], dtype=np.float32),
++        'rew': np.array([t['reward'] for t in trs], dtype=np.float32),
++    }
++
++
++def save_cache(path, batches):
++    arrays = {}
++    for i, b in enumerate(batches):
++        arrays[f'b{i}_obs_n'] = b['obs_n']
++        arrays[f'b{i}_obs_of'] = b['obs_of']
++        arrays[f'b{i}_ret'] = b['ret']
++        arrays[f'b{i}_rew'] = b['rew']
++    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
++    np.savez_compressed(path, **arrays)
++    mb = os.path.getsize(path) / 1e6
++    print(f"[diag] cache sauvé : {path} ({mb:.0f} Mo, "
++          f"{len(batches)} batches)", flush=True)
++
++
++def load_cache(path):
++    z = np.load(path)
++    n = sum(1 for k in z.files if k.endswith('_ret'))
++    batches = []
++    for i in range(n):
++        batches.append({
++            'obs_n': np.asarray(z[f'b{i}_obs_n']),
++            'obs_of': np.asarray(z[f'b{i}_obs_of']),
++            'ret': np.asarray(z[f'b{i}_ret']),
++            'rew': np.asarray(z[f'b{i}_rew']),
++        })
++    print(f"[diag] cache chargé : {path} ({n} batches, collection sautée)",
++          flush=True)
++    return batches
++
++
++def _distinct(vals):
++    return len(np.unique(np.round(np.asarray(vals, dtype=np.float64), 3)))
++
++
++# ---------------------------------------------------------------------- #
++# Fits
++# ---------------------------------------------------------------------- #
++def _values(model, obs_n, obs_of, device, rs, bs=2048):
++    """V(s) en unités reward, par tranches (aucun gradient)."""
+     out = []
+     with torch.no_grad():
+-        for s in range(0, len(obs_n), 2048):
+-            on = torch.as_tensor(obs_n[s:s + 2048], dtype=torch.float32,
+-                                 device=device)
+-            oof = torch.as_tensor(obs_of[s:s + 2048], dtype=torch.float32,
+-                                  device=device)
+-            out.append(critic(torch.cat([on, oof], dim=1)).cpu().numpy())
++        for s in range(0, len(obs_n), bs):
++            on = torch.as_tensor(np.asarray(obs_n[s:s + bs]),
++                                 dtype=torch.float32, device=device)
++            oof = torch.as_tensor(np.asarray(obs_of[s:s + bs]),
++                                  dtype=torch.float32, device=device)
++            out.append(model(on, oof).cpu().numpy())
+     return np.concatenate(out) * rs
+ 
+ 
+-def _eval_loss(critic, obs_n, obs_of, rets, device, rs):
+-    """0.5*MSE en unités normalisées (comparable à vl / cfit)."""
+-    v = _forward(critic, obs_n, obs_of, device, rs) / rs
+-    return float(0.5 * ((v - rets / rs) ** 2).mean())
++def _eval_loss(model, obs_n, obs_of, target, device, rs):
++    """0.5*MSE normalisée (comparable à vl / cfit / cval)."""
++    v = _values(model, obs_n, obs_of, device, rs) / rs
++    return float(0.5 * ((v - target / rs) ** 2).mean())
+ 
+ 
+-def fit_one(train, val, test_batches, wd, archi, args, device):
+-    """Un critic neuf -> époque choisie sur val -> mesures sur test."""
+-    torch.manual_seed(args.seed)
+-    np.random.seed(args.seed)
+-    critic = Critic(channels=archi[0], n_blocks=archi[1]).to(device)
+-    critic.eval()
+-    opt = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
++def fit_one(model, tr, va, test_batches, key, wd, args, device):
++    """Un fit complet ; époque sélectionnée sur val (early-stop)."""
+     rng = np.random.default_rng(args.seed)
++    tn = np.concatenate([b['obs_n'] for b in tr])
++    to = np.concatenate([b['obs_of'] for b in tr])
++    tt = np.concatenate([b[key] for b in tr])
++    vn = np.concatenate([b['obs_n'] for b in va])
++    vo = np.concatenate([b['obs_of'] for b in va])
++    vt = np.concatenate([b[key] for b in va])
+ 
+-    tn = np.stack([t['obs_normal'] for t in train]).astype(np.float16)
+-    to = np.stack([t['obs_oracle_full'] for t in train]).astype(np.float16)
+-    tr = np.array([t['return'] for t in train], dtype=np.float32)
+-    vn = np.stack([t['obs_normal'] for t in val]).astype(np.float16)
+-    vo = np.stack([t['obs_oracle_full'] for t in val]).astype(np.float16)
+-    vr = np.array([t['return'] for t in val], dtype=np.float32)
++    params = [p for p in model.parameters() if p.requires_grad]
++    opt = torch.optim.Adam(params, lr=args.critic_lr)
++    n_train = len(tt)
+ 
+-    best_val, best_state, since_best, best_step = None, None, 0, 0
+-    n = len(train)
++    best_val, best_state, since_best, best_step, stopped_at = (
++        None, None, 0, 0, None)
++    rs = args.reward_scale
++    it = 0
+     for it in range(1, args.steps + 1):
+-        idx = rng.integers(0, n, size=args.minibatch)
++        idx = rng.integers(0, n_train, size=args.minibatch)
+         on = torch.as_tensor(tn[idx], dtype=torch.float32, device=device)
+         oof = torch.as_tensor(to[idx], dtype=torch.float32, device=device)
+-        ret = torch.as_tensor(tr[idx], dtype=torch.float32,
+-                              device=device) / args.reward_scale
+-        v = critic(torch.cat([on, oof], dim=1))
++        ret = torch.as_tensor(tt[idx], dtype=torch.float32,
++                              device=device) / rs
++        v = model(on, oof)
+         loss = 0.5 * ((v - ret) ** 2).mean()
+         if wd > 0:
+-            loss = loss + wd * sum(torch.sum(p * p)
+-                                   for p in critic.parameters())
++            loss = loss + wd * sum(torch.sum(p * p) for p in params)
+         opt.zero_grad()
+         loss.backward()
+         opt.step()
+ 
+         if it % args.check_every == 0:
+-            vloss = _eval_loss(critic, vn, vo, vr, device, args.reward_scale)
++            vloss = _eval_loss(model, vn, vo, vt, device, rs)
+             if best_val is None or vloss < best_val - 1e-6:
+                 best_val, since_best, best_step = vloss, 0, it
+                 best_state = {k: w.detach().cpu().clone()
+-                              for k, w in critic.state_dict().items()}
++                              for k, w in model.state_dict().items()}
+             else:
+                 since_best += 1
+                 if since_best >= args.patience:
++                    stopped_at = it
+                     break
+     if best_state is not None:
+-        critic.load_state_dict(best_state)
++        model.load_state_dict(best_state)
+ 
+     evs, losses = [], []
+     for tb in test_batches:
+-        tn_b = np.stack([t['obs_normal'] for t in tb]).astype(np.float16)
+-        to_b = np.stack([t['obs_oracle_full'] for t in tb]).astype(np.float16)
+-        G = np.array([t['return'] for t in tb], dtype=np.float32)
+-        v = _forward(critic, tn_b, to_b, device, args.reward_scale)
+-        ev = 1.0 - float((G - v).var()) / max(float(G.var()), 1e-8)
+-        evs.append(ev)
+-        losses.append(float(0.5 * ((v / args.reward_scale - G
+-                                    / args.reward_scale) ** 2).mean()))
++        G = tb[key]
++        v = _values(model, tb['obs_n'], tb['obs_of'], device, rs)
++        evs.append(1.0 - float((G - v).var()) / max(float(G.var()), 1e-8))
++        losses.append(float(0.5 * ((v / rs - G / rs) ** 2).mean()))
+     return {'best_val': best_val, 'best_step': best_step,
++            'stopped_at': stopped_at, 'n_steps': it,
+             'evs': evs, 'ev_mean': float(np.mean(evs)),
+             'ev_min': float(np.min(evs)), 'losses': losses}
+ 
+@@ -171,101 +297,115 @@ def main():
+     if device == 'cuda':
+         print(f"[diag] GPU : {torch.cuda.get_device_name(0)}", flush=True)
+     torch.set_num_threads(args.torch_threads)
+-    print(f"[diag] protocole : {args.n_batches} batches ({args.train_batches}"
+-          f" train / {args.val_batches} val / "
+-          f"{args.n_batches - args.train_batches - args.val_batches} test), "
+-          f"policy = SL figée, gamma_t=0, mode=opponent", flush=True)
+ 
+     agent = PPOAgent(args.sl_discard, args.sl_frozen, device=device,
+                      critic_lr=args.critic_lr)
+-    runner = VecRunner(
+-        agent, n_envs=args.n_envs, seed=args.seed,
+-        grp_path=args.grp_checkpoint,
+-        compute_lookahead=args.compute_lookahead, danger_labels=True,
+-        mode='opponent', device=device)
+ 
+-    # ---------------- collecte ---------------- #
+-    batches = []
+-    t0 = time.time()
+-    for i in range(args.n_batches):
+-        eps, _ = runner.collect_batch(args.batch_games, gamma_t=0.0)
+-        trs = [t for ep in eps for t in ep]
+-        rets = np.array([t['return'] for t in trs], dtype=np.float32)
+-        n_distinct = len(np.unique(np.round(rets, 3)))
+-        batches.append(trs)
+-        print(f"  [{i+1:2d}/{args.n_batches}] {len(trs)} tr, "
+-              f"{n_distinct} cibles distinctes (G constant/manche), "
+-              f"mean={rets.mean():+.2f} var={rets.var():.1f} "
+-              f"({time.time()-t0:.0f}s)", flush=True)
++    # ---------------- données : cache ou collecte ---------------- #
++    if os.path.isfile(args.cache):
++        batches = load_cache(args.cache)
++    else:
++        print(f"[diag] protocole : {args.n_batches} batches "
++              f"({args.train_batches} train / {args.val_batches} val / "
++              f"{args.n_batches - args.train_batches - args.val_batches} "
++              f"test), policy = SL figée, gamma_t=0, mode=opponent",
++              flush=True)
++        runner = VecRunner(
++            agent, n_envs=args.n_envs, seed=args.seed,
++            grp_path=args.grp_checkpoint,
++            compute_lookahead=args.compute_lookahead, danger_labels=True,
++            mode='opponent', device=device)
++        batches = []
++        t0 = time.time()
++        for i in range(args.n_batches):
++            eps, _ = runner.collect_batch(args.batch_games, gamma_t=0.0)
++            b = _batch_from_transitions(
++                [t for ep in eps for t in ep])
++            batches.append(b)
++            print(f"  [{i+1:2d}/{args.n_batches}] {len(b['ret'])} tr, "
++                  f"G distincts={_distinct(b['ret'])} "
++                  f"r_k distincts={_distinct(b['rew'])} "
++                  f"(G var={b['ret'].var():.1f} r_k var={b['rew'].var():.1f}) "
++                  f"({time.time()-t0:.0f}s)", flush=True)
++        save_cache(args.cache, batches)
+ 
+     n_tr, n_va = args.train_batches, args.val_batches
++    need = n_tr + n_va + 2
++    assert len(batches) >= need, \
++        f"cache/collecte insuffisant : {len(batches)} < {need} " \
++        f"(relancer avec --n-batches {need} et supprimer {args.cache})"
++    tr, va = batches[:n_tr], batches[n_tr:n_tr + n_va]
+     test_batches = batches[n_tr + n_va:]
+-    assert len(test_batches) >= 2, "pas assez de batches de test"
+-    train = [t for b in batches[:n_tr] for t in b]
+-    val = [t for b in batches[n_tr:n_tr + n_va] for t in b]
+-    print(f"[diag] splits : train={len(train)} val={len(val)} "
+-          f"test={sum(len(b) for b in test_batches)} tr", flush=True)
++    print(f"[diag] splits : train={sum(len(b['ret']) for b in tr)} "
++          f"val={sum(len(b['ret']) for b in va)} "
++          f"test={sum(len(b['ret']) for b in test_batches)} tr", flush=True)
+ 
+-    # références sur test
++    # ---------------- références ---------------- #
+     print("\n[diag] références (test) :")
+-    train_mean = float(np.mean([t['return'] for t in train]))
+-    for k, tb in enumerate(test_batches):
+-        G = np.array([t['return'] for t in tb], dtype=np.float32)
+-        ev_const = 0.0   # par construction
+-        ev_trmean = 1.0 - float((G - train_mean).var()) / max(G.var(), 1e-8)
+-        loss_const = float(0.5 * G.var()) / args.reward_scale ** 2
+-        print(f"  test[{k}] : n={len(tb)}, Var(G)={G.var():.1f}, "
+-              f"EV(const)= {ev_const:+.3f}, EV(moy-train)={ev_trmean:+.3f}, "
+-              f"loss(const)={loss_const:.3f}", flush=True)
++    train_means = {}
++    for key, label in (('ret', 'G_t'), ('rew', 'r_k')):
++        tm = float(np.mean([x for b in tr for x in b[key]]))
++        train_means[key] = tm
++        for k, tb in enumerate(test_batches):
++            G = tb[key]
++            print(f"  test[{k}] {label:3s}: n={len(G)}, "
++                  f"Var={G.var():.1f}, EV(const)=+0.000, "
++                  f"EV(moy-train)={1.0 - float((G - tm).var()) / max(G.var(), 1e-8):+.3f}, "
++                  f"loss(const)={float(0.5 * G.var()) / args.reward_scale ** 2:.3f}",
++                  flush=True)
+ 
+     # ---------------- sweep ---------------- #
++    variants = [v.strip() for v in args.variants.split(',')]
++    targets = [('ret', 'return') if t.strip() == 'return'
++               else ('rew', 'reward') for t in args.targets.split(',')]
+     wds = [float(x) for x in args.wd_list.split(',')]
+-    archis = []
+-    for a in args.archi_list.split(','):
+-        c, b = a.split('x')
+-        archis.append((int(c), int(b)))
+-    print(f"\n[diag] sweep : wd x {wds} | archi x {archis} | "
++    print(f"\n[diag] sweep : variant x {variants} | target x "
++          f"{[lbl for _, lbl in targets]} | wd x {wds} | "
+           f"budget {args.steps} steps, early-stop (val, patience "
+           f"{args.patience})\n", flush=True)
+ 
+-    results = []
+-    for archi in archis:
+-        for wd in wds:
+-            r = fit_one(train, val, test_batches, wd, archi, args, device)
+-            results.append((wd, archi, r))
+-            print(f"  wd={wd:<6g} archi={archi[0]}x{archi[1]} : "
+-                  f"val={r['best_val']:.3f}@{r['best_step']} steps | "
+-                  f"EV test min/mean = {r['ev_min']:+.3f}/{r['ev_mean']:+.3f}"
+-                  f" | loss test {np.mean(r['losses']):.3f}", flush=True)
++    rows = []
++    for variant in variants:
++        for key, tname in targets:
++            for wd in wds:
++                model = build_model_for(variant, agent, device, args.seed)
++                r = fit_one(model, tr, va, test_batches, key, wd,
++                            args, device)
++                rows.append((variant, tname, wd, r))
++                print(f"  {variant:9s} target={tname:6s} wd={wd:<7g} : "
++                      f"val={r['best_val']:.3f}@{r['best_step']} | "
++                      f"EV test min/mean = {r['ev_min']:+.3f}/{r['ev_mean']:+.3f}"
++                      f" | loss test {np.mean(r['losses']):.3f}", flush=True)
+ 
+     # ---------------- verdict ---------------- #
+-    best = max(results, key=lambda x: x[2]['ev_mean'])
+-    wd_b, archi_b, r_b = best
++    best = max(rows, key=lambda x: x[3]['ev_mean'])
++    v_b, t_b, wd_b, r_b = best
+     print("\n" + "=" * 64)
+-    print(f"[VERDICT] meilleure config : wd={wd_b:g} archi={archi_b[0]}x"
+-          f"{archi_b[1]} -> EV test moyen {r_b['ev_mean']:+.3f} "
+-          f"(min {r_b['ev_min']:+.3f})")
++    print(f"[VERDICT] meilleure config : {v_b} + target {t_b} + wd={wd_b:g}"
++          f" -> EV test moyen {r_b['ev_mean']:+.3f} (min {r_b['ev_min']:+.3f})")
+     if r_b['ev_mean'] >= 0.10:
+-        print("[VERDICT] LE CRITIC GÉNÉRALISE. Relancer le trainer avec :")
+-        print(f"          --critic-wd {wd_b:g}   (garder --adv-mode critic "
+-              f"et le replay v2.1)")
+-        print("          lecture attendue : part (critic) > 70%, ev > +0.10,")
+-        print("          cfit ~ cval, agr stabilise >= 0.90, evaux a la "
+-              "baisse d'ici 100k steps.")
++        print("[VERDICT] GO : le signal existe, la sonde le mesure.")
++        print(f"          Rapporter ce tableau — le patch v2.4 câblera "
++              f"«{v_b}» et la cible «{t_b}»")
++        print("          dans le trainer (compute_advantages / critic).")
++        print("          NE PAS relancer le trainer avant ce câblage.")
+     elif r_b['ev_mean'] >= 0.02:
+-        print("[VERDICT] MARGINAL : la porte min_ev=0.02 passera rarement.")
+-        print("          Option : relancer quand même et surveiller la part "
+-              "(critic) ;")
+-        print("          sinon attendre et rapporter ce tableau.")
++        print("[VERDICT] MARGINAL (la porte min_ev=0.02 passera rarement).")
++        print("          Rapporter le tableau avant toute décision.")
+     else:
+-        print("[VERDICT] NON-PRÉDICTIBLE out-of-sample par ce critic.")
+-        print("          NE PAS relancer en --adv-mode critic (la porte "
+-              "rejetterait")
+-        print("          encore tout, cf. run v2.1). Rapporter ce tableau :")
+-        print("          plan B = features GRP en entrée du critic, ou "
+-              "changer la cible")
+-        print("          (delta de manche plutôt que G_t) — mais d'abord "
+-              "mesurer, pas deviner.")
++        print("[VERDICT] NON-PRÉDICTIBLE même avec backbone et cible r_k.")
++        print("          À cette échelle, la réduction de variance par V(s)")
++        print("          n'est PAS disponible en régime no-oracle — comme")
++        print("          l'ablation du papier Suphx le laissait craindre.")
++        print("          Options avant de relancer quoi que ce soit :")
++        print("            (a) curriculum oracle (voie du papier) — corriger")
++        print("                d'abord les pièges du pilot (PHASE_POLICY_LR")
++        print("                phase 3 = 0.1 encore en dur) ;")
++        print("            (b) accepter batch_mean + ancre KL 0.2, run long")
++        print("                sans attente de gain mesurable ;")
++        print("            (c) améliorer le SL d'abord (val_acc 0.667 = le")
++        print("                vrai plafond actuel).")
++        print("          Discuter AVANT de relancer.")
+     print("=" * 64)
+ 
+ 
+diff --git a/mahjong_ai/test_rl_rework.py b/mahjong_ai/test_rl_rework.py
+index 926e6fa..82256c3 100755
+--- a/mahjong_ai/test_rl_rework.py
++++ b/mahjong_ai/test_rl_rework.py
+@@ -23,6 +23,9 @@ Vérifie les invariants qui tuaient l'ancien pipeline :
+     10. [V2.2] RÉGULARISATION : sampler jamais dans la val (skip_newest),
+         early-stop sur val qui remonte, weight decay qui rétrécit les
+         poids, intégration train() (bannière + cfit/cval dans DRIFT).
++    11. [V2.3] DIAG : round-trip du cache npz (f16/f32 exacts),
++        BackboneCritic (V=0 à l'init, tronc SL figé, seule la partie
++        entraînable bouge).
+ """
+ import copy
+ import os
+@@ -479,6 +482,65 @@ def test_10_critic_v22(ckpt_dir):
+     print("    OK")
+ 
+ 
++def test_11_diag_v23(ckpt_dir):
++    print("\n=== TEST 11 : [V2.3] diag : cache + BackboneCritic ===")
++    from mahjong_ai.diag_critic_learnability import (
++        BackboneCritic, save_cache, load_cache, _batch_from_transitions)
++    agent, runner = make_agent_and_runner(ckpt_dir, n_envs=2)
++    batches = []
++    for _ in range(2):
++        eps, _ = runner.collect_batch(2, gamma_t=0.0)
++        batches.append(_batch_from_transitions(
++            [t for ep in eps for t in ep]))
++    assert all(len(b['ret']) >= 30 for b in batches), "batch trop petit"
++
++    # (a) round-trip du cache : octet-exact sur les 4 tableaux
++    path = os.path.join(ckpt_dir, 'diag_cache_test.npz')
++    save_cache(path, batches)
++    loaded = load_cache(path)
++    assert len(loaded) == 2
++    for a, b in zip(loaded, batches):
++        assert a['obs_n'].dtype == np.float16
++        assert np.array_equal(a['obs_n'], b['obs_n'])
++        assert np.array_equal(a['obs_of'], b['obs_of'])
++        assert np.array_equal(a['ret'], b['ret'])
++        assert np.array_equal(a['rew'], b['rew'])
++
++    # (b) BackboneCritic : V=0 exactement à l'init, tronc figé
++    bc = BackboneCritic(agent.sl_discard).eval()
++    on = torch.as_tensor(batches[0]['obs_n'][:8].astype(np.float32))
++    oof = torch.as_tensor(batches[0]['obs_of'][:8].astype(np.float32))
++    with torch.no_grad():
++        v0 = bc(on, oof)
++    assert v0.shape == (8,), v0.shape
++    assert float(v0.abs().max()) == 0.0, "la tête zero-init doit donner V=0"
++    assert all(not p.requires_grad for p in bc.trunk.parameters()), \
++        "le tronc SL doit être figé"
++    n_trainable = sum(1 for p in bc.parameters() if p.requires_grad)
++    assert n_trainable > 0, "aucune partie entraînable"
++
++    # (c) 5 pas de fit : le tronc ne bouge PAS, la partie entraînable si
++    w0 = {k: t.clone() for k, t in bc.trunk.state_dict().items()}
++    opt = torch.optim.Adam(
++        [p for p in bc.parameters() if p.requires_grad], lr=1e-3)
++    tgt = torch.as_tensor(
++        batches[0]['ret'][:8] / 10.0, dtype=torch.float32)
++    for _ in range(5):
++        v = bc(on, oof)
++        loss = 0.5 * ((v - tgt) ** 2).mean()
++        opt.zero_grad()
++        loss.backward()
++        opt.step()
++    for k in w0:
++        assert torch.equal(w0[k], bc.trunk.state_dict()[k]), k
++    with torch.no_grad():
++        v1 = bc(on, oof)
++    assert float(v1.abs().max()) > 0.0, "la partie entraînable n'a pas vécu"
++    print(f"    tronc figé intact, V: 0.0 -> {float(v1.abs().max()):.4f} "
++          f"({n_trainable} tenseurs entraînables)")
++    print("    OK")
++
++
+ def main():
+     tmpdir = tempfile.mkdtemp(prefix='mj_rl_test_')
+     print(f"checkpoints factices : {tmpdir}")
+@@ -494,6 +556,7 @@ def main():
+     test_8_v2_gate0_gate1(tmpdir)
+     test_9_critic_replay(tmpdir)
+     test_10_critic_v22(tmpdir)
++    test_11_diag_v23(tmpdir)
+     print(f"\n=== TOUS LES TESTS PASSENT ({time.time()-t0:.0f}s) ===")
+ 
+ 

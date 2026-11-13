@@ -15,6 +15,17 @@ Vérifie les invariants qui tuaient l'ancien pipeline :
     6. MODES : parties complètes à gamma 1.0 / 0.5 / 0.0, modes opponent
        et selfplay, mode éval argmax.
     7. SMOKE TRAIN : 2 itérations complètes de rl.train.train().
+    8. [V2] accord SL à l'init = 1.0, critic qui absorbe la variance,
+       early-stop KL.
+    9. [V2.1] CRITIC REPLAY : fenêtre FIFO (éviction), échantillonnage
+       uniforme, pas dédiés critic sans toucher la policy, loss
+       in-sample qui baisse sur fenêtre fixe.
+    10. [V2.2] RÉGULARISATION : sampler jamais dans la val (skip_newest),
+        early-stop sur val qui remonte, weight decay qui rétrécit les
+        poids, intégration train() (bannière + cfit/cval dans DRIFT).
+    11. [V2.3] DIAG : round-trip du cache npz (f16/f32 exacts),
+        BackboneCritic (V=0 à l'init, tronc SL figé, seule la partie
+        entraînable bouge).
 """
 import copy
 import os
@@ -295,6 +306,241 @@ def test_8_v2_gate0_gate1(ckpt_dir):
     print("    OK")
 
 
+def test_9_critic_replay(ckpt_dir):
+    print("\n=== TEST 9 : [V2.1] fenêtre replay du critic ===")
+    from mahjong_ai.rl.ppo import CriticReplay, critic_fit
+    agent, runner = make_agent_and_runner(ckpt_dir, n_envs=2)
+    episodes, _ = runner.collect_batch(2, gamma_t=0.0)
+    transitions = [t for ep in episodes for t in ep]
+    assert len(transitions) >= 60, "batch trop petit"
+
+    # (a) push / éviction FIFO / échantillonnage : formes + contenu
+    rep = CriticReplay(capacity_batches=4, seed=0)
+    half = len(transitions) // 2
+    rep.push(transitions[:half])
+    rep.push(transitions[half:])
+    assert len(rep) == len(transitions) and rep.n_batches == 2
+    for _ in range(6):
+        rep.push(transitions[:10])          # 8 pushes, capacité 4
+    assert len(rep) == 40 and rep.n_batches == 4, \
+        f"éviction FIFO cassée : len={len(rep)} batches={rep.n_batches}"
+    on, oof, rets = rep.sample_minibatch(37)
+    assert on.shape == (37, N_CHANNELS, 34), on.shape
+    assert oof.shape == (37, 4, 34) and rets.shape == (37,)
+    w_rets = np.concatenate(rep._rets)      # accès white-box volontaire
+    assert rets.min() >= w_rets.min() - 1e-6, "échantillon hors fenêtre"
+    assert rets.max() <= w_rets.max() + 1e-6, "échantillon hors fenêtre"
+
+    # (b) le fit critic ne touche PAS la policy
+    agr_before = agent.sl_agreement(transitions)
+    w_pol = copy.deepcopy(agent.policy.state_dict())
+    info = critic_fit(agent, rep, n_steps=25, minibatch=32)
+    assert info and info['n_steps'] == 25 and info['loss'] is not None
+    for k in w_pol:
+        assert torch.equal(w_pol[k], agent.policy.state_dict()[k]), k
+    assert agent.sl_agreement(transitions) == agr_before, \
+        "le fit a déplacé la policy"
+
+    # (c) in-sample : la loss baisse en réentraînant sur la même fenêtre
+    l0 = info['loss']
+    for _ in range(3):
+        info = critic_fit(agent, rep, n_steps=25, minibatch=32)
+    print(f"    cfit in-sample : {l0:.4f} -> {info['loss']:.4f} "
+          f"(fenêtre fixe de 40)")
+    assert info['loss'] < l0, "la loss critic ne baisse pas in-sample"
+
+    # (d) intégration train() : --adv-mode critic + replay actif (le
+    #     chemin exact du prochain run), 2 itérations complètes
+    from mahjong_ai.rl.train import build_parser, train
+    out = os.path.join(ckpt_dir, 'rl_smoke_v21', 'rl.pt')
+    argv = [
+        '--sl-discard', os.path.join(ckpt_dir, 'discard.pt'),
+        '--sl-frozen', ckpt_dir,
+        '--grp-checkpoint', os.path.join(ckpt_dir, 'grp.pt'),
+        '--output', out,
+        '--total-steps', '900',
+        '--n-envs', '2', '--batch-games', '2',
+        '--max-batch-transitions', '512',
+        '--minibatch', '128', '--ppo-epochs', '2',
+        '--log-every', '1', '--save-every', '2000',
+        '--oracle-frac', '0.4', '--transition-frac', '0.3',
+        '--stats-window', '50',
+        '--adv-mode', 'critic',
+        '--critic-warmup-updates', '2',
+        '--critic-replay-batches', '3',
+        '--critic-replay-steps', '8',
+    ]
+    args = build_parser().parse_args(argv)
+    train(args)
+    assert os.path.isfile(os.path.splitext(out)[0] + '_latest.pt'), \
+        "checkpoint latest manquant (intégration v2.1)"
+    print("    OK")
+
+
+def test_10_critic_v22(ckpt_dir):
+    print("\n=== TEST 10 : [V2.2] régularisation du critic_fit ===")
+    import io
+    from contextlib import redirect_stdout
+    from mahjong_ai.rl.ppo import CriticReplay, critic_fit
+    from mahjong_ai.agents.oracle_agent import Critic
+    agent, runner = make_agent_and_runner(ckpt_dir, n_envs=2)
+
+    batches = []
+    for _ in range(3):
+        eps, _ = runner.collect_batch(2, gamma_t=0.0)
+        batches.append([t for ep in eps for t in ep])
+    assert all(len(b) >= 30 for b in batches), "batch trop petit"
+
+    # (a) skip_newest : le sampler ne tire JAMAIS dans le batch réservé
+    marker = 424242.0
+    val_batch = [{**t, 'return': marker} for t in batches[-1]]
+    rep = CriticReplay(capacity_batches=10, seed=0)
+    for b in batches[:-1]:
+        rep.push(b)
+    rep.push(val_batch)
+    for _ in range(50):
+        s = rep.sample_minibatch(48, skip_newest=1)
+        assert s is not None and (s[2] != marker).all(), \
+            "le sampler a tiré dans la val"
+    hit = False
+    for _ in range(300):
+        s = rep.sample_minibatch(48, skip_newest=0)
+        if (s[2] == marker).any():
+            hit = True
+            break
+    assert hit, "batch val inaccessible même sans skip (test vide)"
+
+    # (b) early-stop : cibles constantes opposées (train +5, val -5)
+    #     -> la val REMONTE a chaque check -> le fit coupe avant la fin
+    tb = [{**t, 'return': 5.0} for t in batches[0]]
+    vb = [{**t, 'return': -5.0} for t in batches[1]]
+    rep2 = CriticReplay(capacity_batches=10, seed=1)
+    rep2.push(tb)
+    rep2.push(vb)
+    info = critic_fit(agent, rep2, n_steps=120, minibatch=64,
+                      reward_scale=10.0, val_batches=1, patience=3)
+    assert info and info['stopped_at'] is not None, "early-stop muet"
+    assert info['n_steps'] < 120, "l'early-stop n'a rien coupé"
+    assert info['val_loss'] is not None and info['val_loss'] > info['loss'], \
+        "la val doit être > train (cibles opposées)"
+    print(f"    early-stop : coupé a {info['n_steps']}/120 steps "
+          f"(val {info['val_loss']:.3f} > cfit {info['loss']:.3f})")
+
+    # (c) weight decay : mêmes poids initiaux, mêmes steps -> ||W|| plus petit
+    torch.manual_seed(7)
+    base = Critic().state_dict()
+    saved = (agent.critic, agent.critic_optim)
+    norms = {}
+    for wd in (0.0, 1e-2):
+        c = Critic()
+        c.load_state_dict(base)
+        c.eval()
+        agent.critic = c
+        agent.critic_optim = torch.optim.Adam(
+            c.parameters(), lr=1e-3)
+        rep3 = CriticReplay(capacity_batches=10, seed=2)
+        rep3.push([{**t, 'return': 5.0} for t in batches[0]])
+        critic_fit(agent, rep3, n_steps=60, minibatch=64,
+                   reward_scale=10.0, weight_decay=wd, val_batches=0)
+        norms[wd] = sum(float((p * p).sum())
+                        for p in agent.critic.parameters())
+    agent.critic, agent.critic_optim = saved
+    print(f"    ||W||² après 60 steps : wd=0 -> {norms[0.0]:.1f}, "
+          f"wd=1e-2 -> {norms[1e-2]:.1f}")
+    assert norms[1e-2] < norms[0.0], "le weight decay ne rétrécit rien"
+
+    # (d) intégration train() : bannière V2.2 + cfit/cval dans les DRIFT
+    from mahjong_ai.rl.train import build_parser, train
+    out = os.path.join(ckpt_dir, 'rl_smoke_v22', 'rl.pt')
+    argv = [
+        '--sl-discard', os.path.join(ckpt_dir, 'discard.pt'),
+        '--sl-frozen', ckpt_dir,
+        '--grp-checkpoint', os.path.join(ckpt_dir, 'grp.pt'),
+        '--output', out,
+        '--total-steps', '900',
+        '--n-envs', '2', '--batch-games', '2',
+        '--max-batch-transitions', '512',
+        '--minibatch', '128', '--ppo-epochs', '2',
+        '--log-every', '1', '--save-every', '2000',
+        '--oracle-frac', '0.4', '--transition-frac', '0.3',
+        '--stats-window', '50',
+        '--adv-mode', 'critic',
+        '--critic-warmup-updates', '2',
+        '--critic-replay-batches', '3',
+        '--critic-replay-steps', '8',
+        '--critic-wd', '0.001',
+        '--critic-val-batches', '1',
+    ]
+    args = build_parser().parse_args(argv)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        train(args)
+    txt = buf.getvalue()
+    assert '[V2.2]' in txt, "bannière V2.2 absente des logs"
+    assert 'cval=' in txt, "cval absent des lignes DRIFT"
+    assert os.path.isfile(os.path.splitext(out)[0] + '_latest.pt')
+    print("    OK")
+
+
+def test_11_diag_v23(ckpt_dir):
+    print("\n=== TEST 11 : [V2.3] diag : cache + BackboneCritic ===")
+    from mahjong_ai.diag_critic_learnability import (
+        BackboneCritic, save_cache, load_cache, _batch_from_transitions)
+    agent, runner = make_agent_and_runner(ckpt_dir, n_envs=2)
+    batches = []
+    for _ in range(2):
+        eps, _ = runner.collect_batch(2, gamma_t=0.0)
+        batches.append(_batch_from_transitions(
+            [t for ep in eps for t in ep]))
+    assert all(len(b['ret']) >= 30 for b in batches), "batch trop petit"
+
+    # (a) round-trip du cache : octet-exact sur les 4 tableaux
+    path = os.path.join(ckpt_dir, 'diag_cache_test.npz')
+    save_cache(path, batches)
+    loaded = load_cache(path)
+    assert len(loaded) == 2
+    for a, b in zip(loaded, batches):
+        assert a['obs_n'].dtype == np.float16
+        assert np.array_equal(a['obs_n'], b['obs_n'])
+        assert np.array_equal(a['obs_of'], b['obs_of'])
+        assert np.array_equal(a['ret'], b['ret'])
+        assert np.array_equal(a['rew'], b['rew'])
+
+    # (b) BackboneCritic : V=0 exactement à l'init, tronc figé
+    bc = BackboneCritic(agent.sl_discard).eval()
+    on = torch.as_tensor(batches[0]['obs_n'][:8].astype(np.float32))
+    oof = torch.as_tensor(batches[0]['obs_of'][:8].astype(np.float32))
+    with torch.no_grad():
+        v0 = bc(on, oof)
+    assert v0.shape == (8,), v0.shape
+    assert float(v0.abs().max()) == 0.0, "la tête zero-init doit donner V=0"
+    assert all(not p.requires_grad for p in bc.trunk.parameters()), \
+        "le tronc SL doit être figé"
+    n_trainable = sum(1 for p in bc.parameters() if p.requires_grad)
+    assert n_trainable > 0, "aucune partie entraînable"
+
+    # (c) 5 pas de fit : le tronc ne bouge PAS, la partie entraînable si
+    w0 = {k: t.clone() for k, t in bc.trunk.state_dict().items()}
+    opt = torch.optim.Adam(
+        [p for p in bc.parameters() if p.requires_grad], lr=1e-3)
+    tgt = torch.as_tensor(
+        batches[0]['ret'][:8] / 10.0, dtype=torch.float32)
+    for _ in range(5):
+        v = bc(on, oof)
+        loss = 0.5 * ((v - tgt) ** 2).mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    for k in w0:
+        assert torch.equal(w0[k], bc.trunk.state_dict()[k]), k
+    with torch.no_grad():
+        v1 = bc(on, oof)
+    assert float(v1.abs().max()) > 0.0, "la partie entraînable n'a pas vécu"
+    print(f"    tronc figé intact, V: 0.0 -> {float(v1.abs().max()):.4f} "
+          f"({n_trainable} tenseurs entraînables)")
+    print("    OK")
+
+
 def main():
     tmpdir = tempfile.mkdtemp(prefix='mj_rl_test_')
     print(f"checkpoints factices : {tmpdir}")
@@ -308,6 +554,9 @@ def main():
     test_6_modes(tmpdir)
     test_7_smoke_train(tmpdir)
     test_8_v2_gate0_gate1(tmpdir)
+    test_9_critic_replay(tmpdir)
+    test_10_critic_v22(tmpdir)
+    test_11_diag_v23(tmpdir)
     print(f"\n=== TOUS LES TESTS PASSENT ({time.time()-t0:.0f}s) ===")
 
 

@@ -38,7 +38,8 @@ import torch
 
 from mahjong_ai.rl.agent import PPOAgent
 from mahjong_ai.rl.rollout import VecRunner
-from mahjong_ai.rl.ppo import compute_advantages, ppo_update
+from mahjong_ai.rl.ppo import (compute_advantages, ppo_update,
+                                CriticReplay, critic_fit)
 
 
 # ---------------------------------------------------------------------- #
@@ -62,16 +63,25 @@ PHASE_POLICY_LR = {1: 1.0, 2: 1.0, 3: 0.1}
 PHASE_CRITIC_LR = {1: 1.0, 2: 0.5, 3: 0.1}
 
 
-def phase_lr_mult(phase, no_oracle=False):
+def phase_lr_mult(phase, no_oracle=False, phase3_mult=None):
     """Multiplicateurs (policy, critic) du LR pour la phase.
 
     [NO-ORACLE] En regime sans oracle, TOUT l'entrainement se fait en
     conditions de deploiement (gamma=0) : conserver le x0.1 de la
     phase 3 figerait la policy (cf. run rl_lookahead_v1 : pl~0, clip~0,
     kl~0 sur 75k steps). On force donc 1.0 partout.
+
+    [V2.3] phase3_mult : le x0.1 de la phase 3 devient un flag
+    (--phase3-lr-mult, defaut 0.1 = papier). Le curriculum oracle
+    atteint lui aussi la phase 3 ; si la policy y gele (symptome
+    rl_lookahead_v1), la sortie est desormais un flag, pas un edit.
+    Ne s'applique qu'au LR policy (le critic, dormant en batch_mean,
+    garde son x0.1).
     """
     if no_oracle:
         return 1.0, 1.0
+    if phase == 3 and phase3_mult is not None:
+        return float(phase3_mult), PHASE_CRITIC_LR[phase]
     return PHASE_POLICY_LR[phase], PHASE_CRITIC_LR[phase]
 
 
@@ -128,6 +138,9 @@ class StatsWindow:
 # Entraînement
 # ---------------------------------------------------------------------- #
 def train(args):
+    if args.phase3_lr_mult <= 0:
+        raise SystemExit("--phase3-lr-mult doit etre > 0 (0 gelerait la "
+                         "policy en phase 3 ; le papier utilise 0.1)")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if device == 'cuda':
         print(f"[train] GPU : {torch.cuda.get_device_name(0)}")
@@ -186,6 +199,11 @@ def train(args):
     t_start = time.time()
     n_games_total = 0
     last_eval_step = start_step
+    critic_replay = None
+    if (args.adv_mode == 'critic' and args.critic_replay_batches > 0
+            and args.critic_replay_steps > 0):
+        critic_replay = CriticReplay(args.critic_replay_batches,
+                                     seed=args.seed)
 
     print(f"[train] schedule : oracle={args.oracle_frac*100:.0f}% "
           f"transition={args.transition_frac*100:.0f}% "
@@ -198,12 +216,41 @@ def train(args):
     print(f"[train] mode={args.mode} n_envs={args.n_envs} "
           f"batch_games={args.batch_games} minibatch={args.minibatch} "
           f"epochs={args.ppo_epochs} kl_coef={args.kl_coef} "
+          f"rho={args.return_rho:g} phase3_lr=x{args.phase3_lr_mult:g} "
           f"entropy={args.entropy_mode}", flush=True)
+    if args.return_rho == 0:
+        print("[train] [V2.3] RETURN-RHO 0 (myopique) : G_t = r_k. Mesure "
+              "diag v2.3 (20 batches, policy SL figee) : la composante "
+              "manches futures de G_t porte 54 pour-cent de la variance "
+              "(Var 51 contre 23 pour r_k) et aucune config critic ne la "
+              "predit (EV test max +0.024 sur G_t contre +0.033 sur r_k) "
+              "-> bruit pur pour le gradient. Var(avantage brut) attendue "
+              "~23 au lieu de ~51 (visible via adv_var_raw).",
+              flush=True)
     if args.adv_mode == 'critic':
         print(f"[train] [V2] ADV-MODE critic : baseline V(s) asymétrique "
               f"(critic 283c voit l'oracle complet, policy jamais), "
               f"warmup={args.critic_warmup_updates} updates, "
               f"repli batch_mean si EV < {args.min_ev}", flush=True)
+        if args.critic_replay_batches > 0 and args.critic_replay_steps > 0:
+            print(f"[train] [V2.1] CRITIC-REPLAY : fenêtre de "
+                  f"{args.critic_replay_batches} batches + "
+                  f"{args.critic_replay_steps} pas de gradient critic par "
+                  f"update, en plus des 4 epochs PPO. Fix du run v2 : le "
+                  f"critic ne voyait jamais deux fois les mêmes données "
+                  f"(EV ~ 0 en out-of-sample) ; c'est une régression "
+                  f"supervisée, le léger staleness est sans biais pour la "
+                  f"baseline, le ratio PPO reste on-policy strict.",
+                  flush=True)
+            if args.critic_wd > 0 or args.critic_val_batches > 0:
+                print(f"[train] [V2.2] CRITIC-RÉGULARISATION : "
+                      f"wd={args.critic_wd:g}, val={args.critic_val_batches} "
+                      f"batch(es) les plus récents (early-stop patience 3). "
+                      f"Fix du run v2.1 : le critic mémorisait sa fenêtre "
+                      f"(cfit 0.104->0.024) et l'EV sur batch frais devenait "
+                      f"NEGATIF (-0.44) : prédictions confiantes non "
+                      f"corrélées, porte min_ev rejetait 122/122 updates.",
+                      flush=True)
     if args.kl_coef > 0:
         print(f"[train] [V2] ANCRE KL vers le SL de départ : "
               f"coef={args.kl_coef} (réf = policy à l'init = SL)",
@@ -224,8 +271,10 @@ def train(args):
         if args.no_oracle:
             gamma_t = 0.0        # [NO-ORACLE] deploiement partout
         if phase != current_phase:
+            pm, _ = phase_lr_mult(phase, args.no_oracle,
+                                  args.phase3_lr_mult)
             print(f"[step {step:7d}] PHASE {current_phase} -> {phase} "
-                  f"(gamma={gamma_t:.3f})", flush=True)
+                  f"(gamma={gamma_t:.3f}, lr_policy=x{pm:g})", flush=True)
             current_phase = phase
             window.reset()
             recent_entropies.clear()
@@ -276,7 +325,8 @@ def train(args):
                 args.iw_threshold if phase == 3
                 and args.iw_threshold > 0 else None)),
             warmup=warm,
-            lr_policy=args.lr * phase_lr_mult(phase, args.no_oracle)[0],
+            lr_policy=args.lr * phase_lr_mult(
+                phase, args.no_oracle, args.phase3_lr_mult)[0],
             lr_critic=args.critic_lr * phase_lr_mult(
                 phase, args.no_oracle)[1],
             target_kl=(args.target_kl if args.target_kl > 0 else None),
@@ -288,6 +338,19 @@ def train(args):
             if critic_warmup_left == 0:
                 print(f"[step {step}] fin du warmup critic -> la policy "
                       f"s'entraîne avec A = G_t - V(s)", flush=True)
+
+        # [V2.1] critic : push du batch dans la fenêtre + pas dédiés
+        # (le policy n'est pas touché ; le ratio PPO reste on-policy)
+        critic_fit_info = None
+        if critic_replay is not None:
+            critic_replay.push(transitions)
+            critic_fit_info = critic_fit(
+                agent, critic_replay,
+                n_steps=args.critic_replay_steps,
+                minibatch=args.minibatch,
+                reward_scale=args.reward_scale,
+                weight_decay=args.critic_wd,
+                val_batches=args.critic_val_batches)
 
         step += len(transitions)
         n_updates += 1
@@ -337,9 +400,16 @@ def train(args):
             agr_str = 'n/a' if agr is None else f"{agr:.1%}"
             if agr is not None and agr < 0.85:
                 agr_str += '!!'
+            fit_str = ''
+            if critic_fit_info and critic_fit_info.get('loss') is not None:
+                vl = critic_fit_info.get('val_loss')
+                fit_str = (f" cfit={critic_fit_info['loss']:.3f}"
+                           + (f"/cval={vl:.3f}" if vl is not None else "")
+                           + f"({critic_fit_info['window']})")
             print(f"    | DRIFT ret_mean={adv_info['ret_mean']:+.2f} "
                   f"ret_std={adv_info['ret_std']:.2f} "
-                  f"advvar={adv_info['adv_var_raw']:.1f} "
+                  f"advvar={adv_info['adv_var_raw']:.1f}"
+                  f"{fit_str} "
                   f"agr={agr_str} "
                   f"upd={n_updates} collect={t_collect:.0f}s "
                   f"({len(transitions)} tr)", flush=True)
@@ -446,6 +516,12 @@ def build_parser():
                         "(policy et critic). Les frontieres de phases ne "
                         "servent plus qu'aux logs. Rend aussi le resume "
                         "avec un --total-steps plus grand sans danger.")
+    p.add_argument('--phase3-lr-mult', type=float, default=0.1,
+                   help="[V2.3] multiplicateur du LR policy en phase 3 "
+                        "(0.1 = papier, comportement inchangé si omis). "
+                        "Monter a 0.3-1.0 si la policy gele en fin de "
+                        "curriculum (symptome rl_lookahead_v1 : pl~0, "
+                        "clip~0, kl~0). Sans effet avec --no-oracle.")
     p.add_argument('--oracle-init', choices=['zero', 'kaiming'],
                    default='kaiming')
     p.add_argument('--oracle-init-scale', type=float, default=0.25)
@@ -472,7 +548,37 @@ def build_parser():
     p.add_argument('--critic-warmup-updates', type=int, default=30)
     p.add_argument('--reward-scale', type=float, default=10.0)
     p.add_argument('--min-ev', type=float, default=0.02)
-    p.add_argument('--return-rho', type=float, default=0.85)
+    p.add_argument('--return-rho', type=float, default=0.85,
+                   help="[V2.3] actualisation des returns entre manches "
+                        "(0.85 = heritage v9). 0 = myopique : G_t = r_k "
+                        "(delta de la manche courante, penalites "
+                        "individuelles conservees). Mesure diag v2.3 : la "
+                        "composante manches futures porte 54 pour-cent de "
+                        "Var(G_t) (51 contre 23) et aucune config critic "
+                        "ne la predit (EV test max +0.024 sur G_t contre "
+                        "+0.033 sur r_k) -> bruit pur pour le gradient. "
+                        "rho=0 divise la variance brute des avantages par "
+                        "2.2, sans code. Reversible : reprendre le flag "
+                        "a 0.85 retablit G_t complet.")
+    p.add_argument('--critic-replay-batches', type=int, default=10,
+                   help="[V2.1] fenêtre du critic : nombre de batches "
+                        "conservés pour l'entraînement du critic. Fix du "
+                        "run v2 (ev ~ 0 partout) : le critic n'apprenait "
+                        "que sur le batch courant puis le jetait. 0 = "
+                        "désactivé.")
+    p.add_argument('--critic-replay-steps', type=int, default=48,
+                   help="[V2.1] pas de gradient critic SEUL par update, "
+                        "tirés uniformément dans la fenêtre (le policy "
+                        "n'est pas touché). 0 = désactivé.")
+    p.add_argument('--critic-wd', type=float, default=3e-4,
+                   help="[V2.2] weight decay L2 du critic_fit (dans la loss, "
+                        "découplé du PPO). Fix du run v2.1 : sans "
+                        "régularisation le critic mémorisait la fenêtre. "
+                        "0 = off.")
+    p.add_argument('--critic-val-batches', type=int, default=2,
+                   help="[V2.2] batches les plus récents de la fenêtre "
+                        "réservés à la validation (early-stop du fit si la "
+                        "val remonte 3 checks de suite). 0 = off.")
 
     # --- régularisation ---
     p.add_argument('--kl-coef', type=float, default=0.0,
