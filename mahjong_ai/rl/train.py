@@ -38,8 +38,8 @@ import torch
 
 from mahjong_ai.rl.agent import PPOAgent
 from mahjong_ai.rl.rollout import VecRunner
-from mahjong_ai.rl.ppo import (compute_advantages, ppo_update,
-                                CriticReplay, critic_fit)
+from mahjong_ai.rl.ppo import (compute_advantages, compute_event_pen_advantages,
+                                ppo_update, CriticReplay, critic_fit)
 
 
 # ---------------------------------------------------------------------- #
@@ -141,6 +141,10 @@ def train(args):
     if args.phase3_lr_mult <= 0:
         raise SystemExit("--phase3-lr-mult doit etre > 0 (0 gelerait la "
                          "policy en phase 3 ; le papier utilise 0.1)")
+    if args.adv_mode == 'event_pen' and args.danger_penalty <= 0:
+        raise SystemExit("--adv-mode event_pen exige --danger-penalty > 0 "
+                         "(sans pénalité, aucun événement n'existe et la "
+                         "policy loss serait vide)")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if device == 'cuda':
         print(f"[train] GPU : {torch.cuda.get_device_name(0)}")
@@ -251,6 +255,21 @@ def train(args):
                       f"NEGATIF (-0.44) : prédictions confiantes non "
                       f"corrélées, porte min_ev rejetait 122/122 updates.",
                       flush=True)
+    if args.adv_mode == 'event_pen':
+        print(f"[train] [D-2] ADV-MODE event_pen : policy loss masquée "
+              f"sur les seules défausses pénalisées (~1.7% des "
+              f"transitions, diag B), A = -{args.danger_penalty:g} non "
+              f"centré/non normalisé, critic coupé (value_coef=0). "
+              f"L'ancre KL s'applique sur TOUTES les transitions : elle "
+              f"maintient le niveau SL hors événements. advvar attendu "
+              f"~{0.017 * args.danger_penalty ** 2:.2f} (contre ~24 en "
+              f"batch_mean) ; ret_mean reste piloté par la chance de "
+              f"manche (non optimisé ici).", flush=True)
+        if args.kl_coef <= 0:
+            print("[train] [D-2] AVERTISSEMENT : event_pen sans ancre KL "
+                  "(--kl-coef 0) -- hors événements, RIEN ne retient la "
+                  "policy près du SL ; recommandé : --kl-coef 0.05.",
+                  flush=True)
     if args.kl_coef > 0:
         print(f"[train] [V2] ANCRE KL vers le SL de départ : "
               f"coef={args.kl_coef} (réf = policy à l'init = SL)",
@@ -306,11 +325,22 @@ def train(args):
 
         # ---------------- avantages ---------------- #
         warm = critic_warmup_left > 0
-        adv_mode_now = ('critic' if (args.adv_mode == 'critic'
-                                     and not warm) else 'batch_mean')
-        _, adv_info = compute_advantages(
-            agent, transitions, mode=adv_mode_now,
-            reward_scale=args.reward_scale, min_ev=args.min_ev)
+        if args.adv_mode == 'event_pen':
+            # [D-2] avantages par événement : A = -pénalité sur les
+            # défausses pénalisées, 0 ailleurs. Porte de plomberie au
+            # batch 1 : le champ danger doit exister et la part
+            # d'événements coller au diagnostic B (~1.7%).
+            _, adv_info = compute_event_pen_advantages(
+                transitions, args.danger_penalty)
+            if n_updates == 0:
+                _event_pen_selfcheck(adv_info, args,
+                                     n_transitions=len(transitions))
+        else:
+            adv_mode_now = ('critic' if (args.adv_mode == 'critic'
+                                         and not warm) else 'batch_mean')
+            _, adv_info = compute_advantages(
+                agent, transitions, mode=adv_mode_now,
+                reward_scale=args.reward_scale, min_ev=args.min_ev)
 
         # ---------------- update PPO ---------------- #
         metrics = ppo_update(
@@ -330,6 +360,7 @@ def train(args):
             lr_critic=args.critic_lr * phase_lr_mult(
                 phase, args.no_oracle)[1],
             target_kl=(args.target_kl if args.target_kl > 0 else None),
+            event_pen=(args.adv_mode == 'event_pen'),
         )
         if metrics is None:
             continue
@@ -379,9 +410,14 @@ def train(args):
             elapsed = time.time() - t_start
             wo = agent.oracle_weight_norm()
             rdev = metrics['ratio_dev']
-            ev_str = (f" ev={adv_info['ev']:+.3f}"
-                      f"({'critic' if adv_info['used_critic'] else 'mean'})"
-                      ) if args.adv_mode == 'critic' else ''
+            if args.adv_mode == 'critic':
+                ev_str = (f" ev={adv_info['ev']:+.3f}"
+                          f"({'critic' if adv_info['used_critic'] else 'mean'})")
+            elif args.adv_mode == 'event_pen':
+                ev_str = (f" ev%={adv_info['ev_pct']:.2f}"
+                          f"(n={adv_info['n_events']})")
+            else:
+                ev_str = ''
             stop_str = ' KL-STOP' if metrics.get('early_stop') else ''
             print(f"[step {step:7d} | ph{phase} g={gamma_t:.2f}] "
                   f"pl={metrics['policy_loss']:+.4f} "
@@ -445,6 +481,33 @@ def train(args):
     print(f"[train] terminé ({step} steps, {n_updates} updates, "
           f"{n_grad_steps} pas de gradient). "
           f"Checkpoint : {base_out}_latest.pt", flush=True)
+
+
+def _event_pen_selfcheck(info, args, n_transitions):
+    """[D-2] Porte de plomberie du batch 1 (diag B : ~1.7% d'événements).
+
+    Échoue vite (SystemExit) si le champ danger manque ou si la part
+    d'événements est aberrante : en event_pen, une policy loss vide
+    n'apprendrait silencieusement que l'ancre KL. La borne sur la part
+    [0.5%, 5%] n'est appliquée qu'au-delà de 800 transitions (régime
+    du diagnostic B ; en dessous le bruit binomial domine).
+    """
+    pct, adv_ev, n_ev = info['ev_pct'], info['adv_ev'], info['n_events']
+    ok = n_ev > 0 and abs(adv_ev + args.danger_penalty) < 1e-4
+    if ok and n_transitions >= 800:
+        ok = 0.5 <= pct <= 5.0
+    detail = (f"n_ev={n_ev} ev={pct:.2f}% (attendu ~1.7) | "
+              f"adv_ev={adv_ev:+.3f} "
+              f"(attendu {-args.danger_penalty:+.2f})")
+    print(f"[event_pen][check] {detail} | "
+          f"{'OK' if ok else 'ECHEC plomberie'}", flush=True)
+    if not ok:
+        raise SystemExit(
+            "event_pen : part d'événements aberrante ou champ danger "
+            "absent -- vérifier --danger-penalty > 0 (les labels danger "
+            "ne sont calculés que si danger_penalty > 0 ou "
+            "--danger-labels) et que la collecte passe bien par "
+            "VecRunner (même chemin que diag_reward_structure).")
 
 
 def _save(agent, base_out, step, alpha, phase, args, metrics, final=False):
@@ -541,10 +604,15 @@ def build_parser():
     p.add_argument('--value-clip', type=float, default=0.2)
     p.add_argument('--value-coef', type=float, default=0.5)
     p.add_argument('--grad-clip', type=float, default=0.5)
-    p.add_argument('--adv-mode', choices=['batch_mean', 'critic'],
+    p.add_argument('--adv-mode',
+                   choices=['batch_mean', 'critic', 'event_pen'],
                    default='batch_mean',
-                   help="baseline des avantages : batch_mean (papier) ou "
-                        "critic asymétrique V(s) (oracle complet)")
+                   help="baseline des avantages : batch_mean (papier), "
+                        "critic asymétrique V(s) (oracle complet), ou "
+                        "event_pen [D-2] : gradient de policy sur les "
+                        "SEULES défausses pénalisées (A = -pénalité, non "
+                        "centré, exige --danger-penalty > 0 ; l'ancre KL "
+                        "s'applique alors sur toutes les transitions)")
     p.add_argument('--critic-warmup-updates', type=int, default=30)
     p.add_argument('--reward-scale', type=float, default=10.0)
     p.add_argument('--min-ev', type=float, default=0.02)

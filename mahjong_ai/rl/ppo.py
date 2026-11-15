@@ -83,11 +83,68 @@ def compute_advantages(agent, transitions, mode='batch_mean',
     return advs, info
 
 
+def compute_event_pen_advantages(transitions, danger_penalty):
+    """[D-2] Avantages par événement : A = -pénalité sur les SEULES
+    défausses pénalisées, 0 ailleurs. Non centré, non normalisé.
+
+    Mesure diag_reward_structure (20 batches, champ rl_defense2) :
+    Var(r_k) est à 99.3% INTER-manches (chance de tirage rétro-projetée
+    sur chaque défausse du siège) ; la pénalité danger ne touche que
+    ~1.7% des transitions. En batch_mean, le gradient est donc ~98%
+    de bruit de manche sur ~97% des transitions (symptômes rl_defense2 :
+    H 0.815 -> 0.723, dng% 1.27 -> 1.50, ret_mean qui s'effondre).
+    Ce mode isole le seul signal par-transition contrôlable : la
+    défausse prise était-elle dangereuse ? adv = -danger_penalty si
+    t['danger'][t['action']] > 0 (exactement la pénalité appliquée à
+    la collecte par VecRunner._apply_decision), 0 sinon. L'ancre KL de
+    ppo_update (calculée sur TOUTES les transitions) maintient la
+    policy au niveau SL partout ailleurs.
+
+    Non centré / non normalisé, à dessein : centrer ferait remonter
+    +pénalité*(1-p) sur les non-événements (p ~ 0.017 -> +0.04 partout,
+    exactement le biais de plateau qu'on fuit), et normaliser
+    amplifierait d'un facteur ~1/sqrt(p) ~= 3 la seule grandeur que
+    --danger-penalty doit contrôler.
+
+    Retour (advs, info) ; pose t['advantage'] ET t['is_event'] sur
+    chaque transition (clé lue par ppo_update(event_pen=True)).
+    """
+    if danger_penalty <= 0:
+        raise SystemExit("--adv-mode event_pen exige --danger-penalty > 0 "
+                         "(sans pénalité il n'existe aucun événement et "
+                         "la policy loss serait vide)")
+    advs = np.zeros(len(transitions), dtype=np.float32)
+    events = []
+    for i, t in enumerate(transitions):
+        d = t.get('danger')
+        is_ev = d is not None and float(d[int(t['action'])]) > 0
+        events.append(bool(is_ev))
+        if is_ev:
+            advs[i] = -float(danger_penalty)
+    n_ev = int(sum(events))
+    for i, t in enumerate(transitions):
+        t['is_event'] = events[i]
+        t['advantage'] = float(advs[i])
+    returns = np.array([t['return'] for t in transitions], dtype=np.float32)
+    info = {
+        'ev': 0.0, 'used_critic': False,      # clés du format DRIFT
+        'ret_mean': float(returns.mean()) if len(returns) else 0.0,
+        'ret_std': float(returns.std()) if len(returns) else 0.0,
+        'adv_var_raw': float(advs.var()) if len(advs) > 1 else 0.0,
+        'n_events': n_ev,
+        'ev_pct': 100.0 * n_ev / max(len(transitions), 1),
+        'adv_ev': (float(advs[np.asarray(events, dtype=bool)].mean())
+                   if n_ev else 0.0),
+    }
+    return advs, info
+
+
 def ppo_update(agent, transitions, epochs=4, minibatch=512,
                clip_eps=0.2, value_clip=0.2, value_coef=0.5,
                entropy_coef=0.0, kl_coef=0.0, grad_clip=0.5,
                reward_scale=10.0, iw_threshold=None, warmup=False,
-               lr_policy=None, lr_critic=None, target_kl=None):
+               lr_policy=None, lr_critic=None, target_kl=None,
+               event_pen=False):
     """Une itération PPO complète sur le batch collecté.
 
     warmup=True : seul le critic est optimisé (policy figée) — utilisé au
@@ -99,6 +156,15 @@ def ppo_update(agent, transitions, epochs=4, minibatch=512,
     4 epochs peuvent détruire en un batch ce que l'ancre KL reconstruit
     en 20 (cf. effondrement rl_nooracle_v1 : kl~+0.02 PAR update, 3856
     updates). 0.015 = standard PPO.
+
+    event_pen : [D-2] mode avantages par événement (transitions passées
+    par compute_event_pen_advantages). La policy loss ne reçoit que les
+    transitions pénalisées, normalisées par le nombre TOTAL d'événements
+    du batch : cumulée sur les minibatchs d'une epoch, elle redonne
+    EXACTEMENT la moyenne par événement du batch complet, quel que soit
+    --minibatch (un minibatch sans événement contribue 0). Ancre KL et
+    entropie restent calculées sur TOUTES les transitions ; critic
+    coupé (value_coef forcé à 0 : A ne dépend pas de V(s)).
 
     Retour : dict de métriques ('early_stop' : True si coupé).
     """
@@ -125,6 +191,17 @@ def ppo_update(agent, transitions, epochs=4, minibatch=512,
                        dtype=np.float32)            # unités reward
     advs = np.array([t['advantage'] for t in transitions],
                     dtype=np.float32)
+
+    event_pen = bool(event_pen)
+    event_mask, n_ev_total = None, 1
+    if event_pen:
+        # [D-2] masque posé par compute_event_pen_advantages ; absent
+        # des autres modes -> défaut False partout.
+        event_mask = np.array(
+            [bool(t.get('is_event', False)) for t in transitions],
+            dtype=np.float32)
+        n_ev_total = max(int(event_mask.sum()), 1)
+        value_coef = 0.0     # critic inutilisé : A = -pénalité, pas V(s)
 
     mb = max(8, min(minibatch, B))
     metrics = {
@@ -185,7 +262,21 @@ def ppo_update(agent, transitions, epochs=4, minibatch=512,
             # ---- policy loss (clipped surrogate) ----
             s1 = ratio * adv
             s2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
-            policy_loss = -(torch.min(s1, s2) * keep).mean()
+            if event_pen:
+                # [D-2] gradient sur les SEULES transitions pénalisées.
+                # Somme divisée par le nombre TOTAL d'événements du
+                # batch (pas du minibatch) : cumulée sur les minibatchs
+                # d'une epoch, elle redonne exactement la moyenne par
+                # événement du batch complet. Le produit par ev garde
+                # le graphe connecté même sur un minibatch sans
+                # événement (contribution exactement 0, pas de crash
+                # backward).
+                ev = torch.as_tensor(event_mask[idx], dtype=torch.float32,
+                                     device=agent.device)
+                policy_loss = -(torch.min(s1, s2) * ev * keep).sum() \
+                    / n_ev_total
+            else:
+                policy_loss = -(torch.min(s1, s2) * keep).mean()
 
             # ---- value loss avec clipping (PPO standard) ----
             v_clipped = ov + torch.clamp(values - ov, -value_clip,

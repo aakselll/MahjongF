@@ -26,6 +26,11 @@ Vérifie les invariants qui tuaient l'ancien pipeline :
     11. [V2.3] DIAG : round-trip du cache npz (f16/f32 exacts),
         BackboneCritic (V=0 à l'init, tronc SL figé, seule la partie
         entraînable bouge).
+    12. [D-2] EVENT-PEN : avantages par événement (masque exact,
+        non centré/non normalisé, garde sans pénalité), ppo_update
+        event_pen (minibatchs sans événement, critic figé, policy qui
+        bouge), porte de plomberie _event_pen_selfcheck, intégration
+        train() complète.
 """
 import copy
 import os
@@ -541,6 +546,147 @@ def test_11_diag_v23(ckpt_dir):
     print("    OK")
 
 
+def test_12_event_pen(ckpt_dir):
+    print("\n=== TEST 12 : [D-2] avantages par événement (event_pen) ===")
+    import argparse
+    import io
+    from contextlib import redirect_stdout
+    from mahjong_ai.rl.ppo import compute_event_pen_advantages
+    from mahjong_ai.rl.train import (build_parser, train,
+                                     _event_pen_selfcheck)
+
+    agent, runner = make_agent_and_runner(ckpt_dir, n_envs=2)
+    eps, _ = runner.collect_batch(4, gamma_t=0.0, danger_penalty=2.5)
+    transitions = [t for ep in eps for t in ep]
+    assert len(transitions) >= 60, "batch trop petit"
+    assert all(t.get('danger') is not None for t in transitions), \
+        "labels danger absents alors que danger_labels=True"
+
+    # (a) unitaire : 5 événements garantis (mutation white-box du label,
+    # comme le marker 424242 des tests V2.2) + éventuels événements
+    # naturels du batch.
+    for t in transitions[:5]:
+        d = t['danger'].copy()
+        d[int(t['action'])] = 1
+        t['danger'] = d
+    advs, info = compute_event_pen_advantages(transitions, 2.5)
+    n_ev = sum(1 for t in transitions if t['is_event'])
+    assert n_ev >= 5 and info['n_events'] == n_ev
+    assert abs(info['adv_ev'] + 2.5) < 1e-6
+    # non centré : 0 EXACT sur les non-événements (pas de +p*(1-p))
+    assert all(t['advantage'] == 0.0
+               for t in transitions if not t['is_event'])
+    assert all(t['advantage'] == -2.5
+               for t in transitions if t['is_event'])
+    # non normalisé : Var brute = p(1-p) * d^2, pas 1
+    p = n_ev / len(transitions)
+    assert abs(info['adv_var_raw'] - p * (1 - p) * 2.5 ** 2) < 1e-4
+    # garde : sans pénalité -> refus immédiat (policy loss vide)
+    try:
+        compute_event_pen_advantages(transitions, 0.0)
+        raise AssertionError("danger_penalty=0 accepté en event_pen")
+    except SystemExit:
+        pass
+    print(f"    (a) n_ev={n_ev}/{len(transitions)} "
+          f"({info['ev_pct']:.2f}%) adv_ev={info['adv_ev']:+.2f} "
+          f"advvar={info['adv_var_raw']:.3f}")
+
+    # (b) ppo_update(event_pen=True) : minibatch=8 -> la plupart des
+    # minibatchs SANS événement (l'ancien crash potentiel) ; la policy
+    # bouge (ancre KL), le critic ne bouge PAS (value_coef forcé à 0).
+    w0 = copy.deepcopy(agent.policy.state_dict())
+    c0 = copy.deepcopy(agent.critic.state_dict())
+    m = ppo_update(agent, transitions, epochs=2, minibatch=8,
+                   event_pen=True, kl_coef=0.05)
+    assert m['n_grad_steps'] > 0 and m['batch_size'] == len(transitions)
+    n_changed = sum(
+        int(not torch.equal(w0[k], agent.policy.state_dict()[k]))
+        for k in w0)
+    assert n_changed > 0, "la policy n'a pas bougé (masque mort ?)"
+    assert all(torch.equal(c0[k], agent.critic.state_dict()[k])
+               for k in c0), "le critic a bougé (value_coef != 0 ?)"
+    print(f"    (b) grad-steps={m['n_grad_steps']} "
+          f"(mb=8, plupart sans événement) policy modifiée, critic figé")
+
+    # (c) porte de plomberie : passe au régime nominal, échoue sur
+    # champ absent / part aberrante / signe inversé.
+    ns = argparse.Namespace(danger_penalty=2.5)
+    _event_pen_selfcheck(
+        {'n_events': 37, 'ev_pct': 1.7, 'adv_ev': -2.5}, ns,
+        n_transitions=2190)
+    for bad in (
+            {'n_events': 0, 'ev_pct': 0.0, 'adv_ev': 0.0},      # champ absent
+            {'n_events': 400, 'ev_pct': 40.0, 'adv_ev': -2.5},   # part aberrante
+            {'n_events': 37, 'ev_pct': 1.7, 'adv_ev': +2.5}):    # signe
+        try:
+            _event_pen_selfcheck(bad, ns, n_transitions=2190)
+            raise AssertionError(f"selfcheck muet sur {bad}")
+        except SystemExit:
+            pass
+    print("    (c) selfcheck : OK au nominal, SystemExit sur les 3 casses")
+
+    # (d) intégration train() : --adv-mode event_pen, itérations
+    # complètes (chemin exact du run D-2, --no-oracle + ancre KL).
+    # Les checkpoints factices produisent ~0.07% d'événements danger
+    # naturels (mesuré : 3/4330 ; adversaires aléatoires quasi jamais
+    # tenpai) contre ~1.7% avec les vrais SL (diag B) : la porte
+    # [0.5%, 5%] ne peut qu'échouer ici, et c'est son travail. Le
+    # wrapper white-box ci-dessous (même esprit que le marker 424242
+    # des tests V2.2) garantit >= 1 événement par batch pour exercer
+    # le chemin masqué COMPLET de train() ; la logique non masquée est
+    # déjà couverte par (a)-(c). B < 800 -> seule la porte plomberie
+    # (n_ev > 0, signe) s'applique, de façon déterministe.
+    import mahjong_ai.rl.train as TR
+    real_cepa = TR.compute_event_pen_advantages
+
+    def cepa_with_events(transitions, pen):
+        advs, info = real_cepa(transitions, pen)
+        if info['n_events'] == 0:
+            d = transitions[0]['danger'].copy()
+            d[int(transitions[0]['action'])] = 1
+            transitions[0]['danger'] = d
+            advs, info = real_cepa(transitions, pen)
+        return advs, info
+
+    TR.compute_event_pen_advantages = cepa_with_events
+    try:
+        out = os.path.join(ckpt_dir, 'rl_smoke_d2', 'rl.pt')
+        argv = [
+            '--sl-discard', os.path.join(ckpt_dir, 'discard.pt'),
+            '--sl-frozen', ckpt_dir,
+            '--grp-checkpoint', os.path.join(ckpt_dir, 'grp.pt'),
+            '--output', out,
+            '--total-steps', '700',
+            '--n-envs', '2', '--batch-games', '2',
+            '--max-batch-transitions', '512',
+            '--minibatch', '32', '--ppo-epochs', '2',
+            '--log-every', '1', '--save-every', '5000',
+            '--oracle-frac', '0.4', '--transition-frac', '0.3',
+            '--stats-window', '50',
+            '--no-oracle',
+            '--adv-mode', 'event_pen',
+            '--danger-penalty', '2.5',
+            '--kl-coef', '0.05',
+        ]
+        args = build_parser().parse_args(argv)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            train(args)
+    finally:
+        TR.compute_event_pen_advantages = real_cepa
+    txt = buf.getvalue()
+    assert '[D-2]' in txt, "bannière D-2 absente des logs"
+    assert '[event_pen][check]' in txt, "selfcheck batch 1 absent"
+    check_line = [l for l in txt.splitlines()
+                  if '[event_pen][check]' in l][0]
+    assert 'OK' in check_line, f"selfcheck échoué : {check_line}"
+    assert 'ev%=' in txt, "ev%/n_ev absents des lignes de log"
+    assert os.path.isfile(os.path.splitext(out)[0] + '_latest.pt'), \
+        "checkpoint latest manquant (intégration D-2)"
+    print(f"    (d) intégration : {check_line.strip()}")
+    print("    OK")
+
+
 def main():
     tmpdir = tempfile.mkdtemp(prefix='mj_rl_test_')
     print(f"checkpoints factices : {tmpdir}")
@@ -557,6 +703,7 @@ def main():
     test_9_critic_replay(tmpdir)
     test_10_critic_v22(tmpdir)
     test_11_diag_v23(tmpdir)
+    test_12_event_pen(tmpdir)
     print(f"\n=== TOUS LES TESTS PASSENT ({time.time()-t0:.0f}s) ===")
 
 
