@@ -165,7 +165,9 @@ class VecRunner:
             self.slots.append(_Slot(env, agent_seat=None))
         self.seat_rng = np.random.RandomState((seed or 0) + 7777)
         la_str = 'ON' if compute_lookahead else (
-            'OFF (canaux de toute façon morts, cf. ANALYSE_RL.md)')
+            "OFF (80 canaux lookahead mis a zero a l'execution : OK "
+            "seulement si le SL de depart fut entraine SANS lookahead "
+            "-- verifier avec mahjong_ai.check_sl_lookahead)")
         print(f"[vec_runner] {self.n_envs} envs, mode={mode}, "
               f"lookahead={la_str}", flush=True)
 
@@ -231,7 +233,7 @@ class VecRunner:
                 self._apply_decision(slot, a, ex, collect, danger_penalty)
                 result = slot.env.step(a)
                 self._after_step(slot, result, collect,
-                                 grp_terminal_correction)
+                                 grp_terminal_correction, return_rho)
                 if result.get('game_done', False):
                     episodes.append(slot.transitions)
                     all_stats.append(self._finish_game(slot))
@@ -338,7 +340,8 @@ class VecRunner:
         slot.transitions.append(tr)
         slot.round_idx_per_seat[seat].append(len(slot.transitions) - 1)
 
-    def _after_step(self, slot, result, collect, grp_terminal_correction):
+    def _after_step(self, slot, result, collect, grp_terminal_correction,
+                    return_rho=0.85):
         if not result['round_done']:
             slot.req = result['next_request']
             return
@@ -394,7 +397,12 @@ class VecRunner:
                     if last is not None:
                         last['reward'] += correction
             if slot.transitions:
-                finalize_returns(slot.transitions)
+                # [V2.3b FIX RETURN-RHO] le flag --return-rho atteint enfin
+                # finalize_returns. Avant : collect_batch l'acceptait mais ne
+                # le transmettait pas -> rho=0.85 en dur, le flag etait un
+                # placebo (advvar ~53 = Var(G_t 0.85) dans tous les logs,
+                # au lieu de ~24 = Var(r_k) attendu avec --return-rho 0).
+                finalize_returns(slot.transitions, rho=return_rho)
         else:
             # manche terminée mais partie en cours -> manche suivante
             slot.req = slot.env.reset_round()

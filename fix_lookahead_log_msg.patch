@@ -1,0 +1,13 @@
+--- a/mahjong_ai/rl/rollout.py
++++ b/mahjong_ai/rl/rollout.py
+@@ -165,7 +165,9 @@
+             self.slots.append(_Slot(env, agent_seat=None))
+         self.seat_rng = np.random.RandomState((seed or 0) + 7777)
+         la_str = 'ON' if compute_lookahead else (
+-            'OFF (canaux de toute façon morts, cf. ANALYSE_RL.md)')
++            "OFF (80 canaux lookahead mis a zero a l'execution : OK "
++            "seulement si le SL de depart fut entraine SANS lookahead "
++            "-- verifier avec mahjong_ai.check_sl_lookahead)")
+         print(f"[vec_runner] {self.n_envs} envs, mode={mode}, "
+               f"lookahead={la_str}", flush=True)
+ 

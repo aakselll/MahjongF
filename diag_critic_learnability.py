@@ -1,80 +1,170 @@
-"""[V2.2] Expérience décisive : le critic peut-il prédire G_t OUT-OF-SAMPLE ?
+"""[V2.4] Le critic peut-il prédire la valeur ? Troisième salve de sondes.
 
-Contexte (run v2.1, checkpoints/rl_v21, 265k steps arrêté) : la fenêtre de
-replay a réglé « le critic ne voit jamais deux fois les mêmes données » mais
-produit l'échec inverse — le critic MÉMORISE la fenêtre :
-    cfit 0.104 -> 0.024 (10x sous le prédicteur-constant ~0.25)
-    EV sur batch frais : +0.000 -> -0.44 (prédictions confiantes non
-    corrélées : Var(A) = Var(G) + Var(V))
-    porte min_ev : 122 rejets sur 122 updates -> batch_mean partout.
+Verdict v2.3 (policy SL figée, 20 batches, champ production rl_defense2) :
+std + target r_k + wd=3e-4 -> EV test +0.033 (min -0.013) : MARGINAL.
+Le run rl_defense2 (return-rho=0, G_t = r_k, adv=batch_mean) A ÉCHOUÉ
+sur ce signal : mr échantillonné 2.35 -> 2.67, argmax 2.53 (figé), proxy
+myopique ret_mean -0.14 -> -0.87. Conclusion de session : le goulot
+n'est pas la variance du gradient, c'est l'INFORMATION PAR TRANSITION.
 
-Cette expérience répond AVANT de relancer un run de 8h :
+NOUVEAUTÉ v2.4 — cibles par COMPOSANTE (jamais testées) :
+  ghand     to-go dans la manche courante, coupé à la fin de CETTE
+            manche, attribution causale par événement (cf.
+            diag_reward_structure pour la définition exacte).
+            NB : sous l'attribution plateau-par-main, ghand ≡ r_k à
+            ~1e-2 près — le rapport de structure le chiffre ; le fit
+            n'est là que pour l'inscrire sur table.
+  ghand_nc  ghand sans la correction terminale de rang.
+  rnd       le delta GRP de la manche, SEUL — la composante qui domine
+            r_k. La vraie question nouvelle : un critic peut-il prédire
+            le delta de main DEPUIS l'état ? Si oui (EV >= 0.10), une
+            baseline ÉTAT-DÉPENDANTE existe pour la partie plateau de
+            l'avantage ; sinon le critic est mort en régime no-oracle,
+            et le plan D bascule sur « événements seuls » (masque du
+            policy loss sur les transitions non informatives).
 
-  1. collecte N batches SANS entraînement (policy = SL figée, conditions
-     du trainer : mode=opponent, gamma_t=0, danger labels) ;
-  2. split temporel train / val / test — le test n'est JAMAIS vu, il joue
-     le rôle du « batch frais » que mesure la porte EV du trainer ;
-  3. pour chaque config (weight_decay x archi) : critic NEUF, entraîné
-     sur train, époque sélectionnée sur val (early-stop), mesuré sur
-     test : EV = 1 - Var(G - V)/Var(G), exactement la métrique de la
-     porte (min_ev=0.02) ;
-  4. références : prédicteur-constant (EV=0 par construction) et
-     moyenne-du-train (montre le coût du décalage batch).
+PROTOCOLE : inchangé v2.3 (même grille std/backbone, mêmes pas, même
+early-stop) pour que les EV restent comparables entre v2.3 et v2.4.
 
-Verdicts :
-    EV test >= 0.10  -> relancer le trainer avec --critic-wd <gagnant>
-    0.02 <= EV < 0.10 -> marginal (la porte passera rarement) ;
-    EV <= 0.02       -> cible non prédictible par cette archi : NE PAS
-                        relancer en --adv-mode critic ; rapporter le
-                        tableau (plan B : entrée features GRP, archi
-                        différente).
+DONNÉES : le cache v2.3 ne contient que ret/rew. Les nouvelles cibles
+exigent le cache INSTRUMENTÉ de diag_reward_structure (clés crr/pen/
+rnd/fls/cor/ghd/ghn/round). Lancer d'abord (collecte ~1 h) :
+    py -3.14 -m mahjong_ai.diag_reward_structure ^
+        --sl-discard ... --sl-frozen ... ^
+        --grp-checkpoint checkpoints/grp_tonpusen.pt ^
+        --compute-lookahead --n-batches 20 ^
+        --cache checkpoints/diag_struct_cache.npz
+puis le présent diag avec le MÊME --cache. Un cache v2.3 (ret/rew
+seuls) continue de fonctionner avec --targets return,reward.
 
-Exécution (~1h : collecte ~50 min + ~10 configs x ~30s de fit) :
-    py -3.14 -m mahjong_ai.diag_critic_learnability \
-        --sl-discard checkpoints/sl_tonpusen_la/discard.pt \
-        --sl-frozen checkpoints/sl_tonpusen_la \
-        --grp-checkpoint checkpoints/grp_tonpusen.pt \
-        --compute-lookahead
+Exécution (fits seuls, ~3 min par config sur GPU, ~30 min pour 12) :
+    py -3.14 -m mahjong_ai.diag_critic_learnability ^
+        --sl-discard checkpoints/sl_tonpusen_la/discard.pt ^
+        --sl-frozen checkpoints/sl_tonpusen_la ^
+        --cache checkpoints/diag_struct_cache.npz ^
+        --targets reward,rnd,ghand_nc --variants std,backbone
 """
 import argparse
 import os
 import sys
-import time
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mahjong_ai.rl.agent import PPOAgent
-from mahjong_ai.rl.rollout import VecRunner
 from mahjong_ai.agents.oracle_agent import Critic
+from mahjong_ai.diag_reward_structure import load_cache
+
+
+# ---------------------------------------------------------------------- #
+# Variantes de critic — interface commune forward(obs_n, obs_of) -> (B,)
+# en unités NORMALISÉES (cible = G/10), comme le Critic du trainer.
+# ---------------------------------------------------------------------- #
+class StdCritic(nn.Module):
+    """Adaptateur du Critic standard (référence = config v2.2/v2.3)."""
+
+    def __init__(self, channels=64, n_blocks=4):
+        super().__init__()
+        self.core = Critic(channels=channels, n_blocks=n_blocks)
+
+    def forward(self, obs_n, obs_of):
+        return self.core(torch.cat([obs_n, obs_of], dim=1))
+
+
+class BackboneCritic(nn.Module):
+    """V(s) sur tronc SL pré-entraîné (FIGÉ) + branche oracle entraînable.
+
+    Tronc : celui du modèle discard SL (canaux normaux 279) — features
+    apprises sur des millions de parties humaines, BN en running-stats
+    (déterministe). Aucun paramètre du tronc ne bouge.
+
+    Branche oracle : 2 conv (3,1) sur les 4 canaux (3 mains adverses +
+    mur). Tête : mean+max pooling des deux voies -> MLP -> 1.
+    Tête finale zero-init : V = 0 exactement au départ.
+    """
+
+    def __init__(self, sl_model, branch_ch=32, hidden=128):
+        super().__init__()
+        self.trunk = sl_model.trunk
+        self.trunk.eval()
+        for p in self.trunk.parameters():
+            p.requires_grad_(False)
+        c = self.trunk.input_conv.out_channels
+
+        self.branch = nn.Sequential(
+            nn.Conv2d(4, branch_ch, (3, 1), padding=(1, 0), bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(branch_ch, branch_ch, (3, 1), padding=(1, 0),
+                      bias=True),
+            nn.ReLU(inplace=True),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(2 * c + 2 * branch_ch, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, 1),
+        )
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+
+    def forward(self, obs_n, obs_of):
+        with torch.no_grad():                       # tronc figé
+            f = self.trunk(obs_n.unsqueeze(-1)).squeeze(-1)   # (B,128,34)
+        g = self.branch(obs_of.unsqueeze(-1)).squeeze(-1)     # (B,32,34)
+        pf = torch.cat([f.mean(-1), f.amax(-1)], dim=1)       # (B,256)
+        pg = torch.cat([g.mean(-1), g.amax(-1)], dim=1)       # (B,64)
+        return self.head(torch.cat([pf, pg], dim=1)).squeeze(-1)
+
+
+def build_model_for(variant, agent, device, seed):
+    """Construit la variante (partie aléatoire reproductible)."""
+    torch.manual_seed(seed)
+    if variant == 'std':
+        m = StdCritic(channels=64, n_blocks=4)
+    elif variant == 'backbone':
+        m = BackboneCritic(agent.sl_discard)
+    else:
+        raise ValueError(variant)
+    return m.to(device).eval()
+
+
+# ---------------------------------------------------------------------- #
+# Cibles : nom CLI -> (clé du batch, label)
+# ---------------------------------------------------------------------- #
+TARGETS = {
+    'return':   ('ret', 'G_t(rho)'),
+    'reward':   ('rew', 'r_k'),
+    'ghand':    ('ghd', 'ghand'),
+    'ghand_nc': ('ghn', 'ghand_nc'),
+    'rnd':      ('rnd', 'rnd(delta main)'),
+}
+# ordre canonique d'affichage des références (présentes uniquement)
+CANON = ('ret', 'rew', 'ghd', 'ghn', 'rnd')
+CANON_LABEL = {'ret': 'G_t(rho)', 'rew': 'r_k', 'ghd': 'ghand',
+               'ghn': 'ghand_nc', 'rnd': 'rnd(delta main)'}
 
 
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.
                                 RawDescriptionHelpFormatter)
-    # mêmes chemins que rl.train
     p.add_argument('--sl-discard', required=True)
     p.add_argument('--sl-frozen', required=True)
-    p.add_argument('--grp-checkpoint', default=None)
-    # collecte : conditions identiques au trainer
-    p.add_argument('--n-envs', type=int, default=16)
-    p.add_argument('--batch-games', type=int, default=32)
-    p.add_argument('--n-batches', type=int, default=20,
-                   help='total collecté (= 12 train + 4 val + 4 test '
-                        'par défaut)')
-    p.add_argument('--train-batches', type=int, default=12)
-    p.add_argument('--val-batches', type=int, default=4)
-    p.add_argument('--compute-lookahead', action='store_true')
+    p.add_argument('--cache', required=True,
+                   help='npz de diag_reward_structure (étendu) ou du '
+                        'v2.3 (ret/rew seuls)')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--torch-threads', type=int, default=2)
     # sweep
-    p.add_argument('--wd-list', type=str, default='0,1e-4,3e-4,1e-3,3e-3')
-    p.add_argument('--archi-list', type=str, default='64x4,32x2')
-    p.add_argument('--steps', type=int, default=4000,
-                   help='budget max par config (early-stop sur val)')
+    p.add_argument('--variants', default='std,backbone')
+    p.add_argument('--targets', default='return,reward',
+                   help='return = G_t(rho) ; reward = r_k ; ghand = to-go '
+                        'dans la manche courante ; ghand_nc = sans '
+                        'correction ; rnd = delta de manche seul. '
+                        'Les 3 dernières exigent le cache instrumenté.')
+    p.add_argument('--wd-list', default='0,0.0003')
+    p.add_argument('--steps', type=int, default=4000)
     p.add_argument('--minibatch', type=int, default=512)
     p.add_argument('--check-every', type=int, default=25)
     p.add_argument('--patience', type=int, default=6)
@@ -84,82 +174,81 @@ def build_parser():
 
 
 # ---------------------------------------------------------------------- #
-def _forward(critic, obs_n, obs_of, device, rs):
-    """V(s) en unités reward, par tranches."""
+# Fits (identiques v2.3 : comparabilité)
+# ---------------------------------------------------------------------- #
+def _values(model, obs_n, obs_of, device, rs, bs=2048):
+    """V(s) en unités reward, par tranches (aucun gradient)."""
     out = []
     with torch.no_grad():
-        for s in range(0, len(obs_n), 2048):
-            on = torch.as_tensor(obs_n[s:s + 2048], dtype=torch.float32,
-                                 device=device)
-            oof = torch.as_tensor(obs_of[s:s + 2048], dtype=torch.float32,
-                                  device=device)
-            out.append(critic(torch.cat([on, oof], dim=1)).cpu().numpy())
+        for s in range(0, len(obs_n), bs):
+            on = torch.as_tensor(np.asarray(obs_n[s:s + bs]),
+                                 dtype=torch.float32, device=device)
+            oof = torch.as_tensor(np.asarray(obs_of[s:s + bs]),
+                                 dtype=torch.float32, device=device)
+            out.append(model(on, oof).cpu().numpy())
     return np.concatenate(out) * rs
 
 
-def _eval_loss(critic, obs_n, obs_of, rets, device, rs):
-    """0.5*MSE en unités normalisées (comparable à vl / cfit)."""
-    v = _forward(critic, obs_n, obs_of, device, rs) / rs
-    return float(0.5 * ((v - rets / rs) ** 2).mean())
+def _eval_loss(model, obs_n, obs_of, target, device, rs):
+    """0.5*MSE normalisée (comparable à vl / cfit / cval)."""
+    v = _values(model, obs_n, obs_of, device, rs) / rs
+    return float(0.5 * ((v - target / rs) ** 2).mean())
 
 
-def fit_one(train, val, test_batches, wd, archi, args, device):
-    """Un critic neuf -> époque choisie sur val -> mesures sur test."""
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    critic = Critic(channels=archi[0], n_blocks=archi[1]).to(device)
-    critic.eval()
-    opt = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
+def fit_one(model, tr, va, test_batches, key, wd, args, device):
+    """Un fit complet ; époque sélectionnée sur val (early-stop)."""
     rng = np.random.default_rng(args.seed)
+    tn = np.concatenate([b['obs_n'] for b in tr])
+    to = np.concatenate([b['obs_of'] for b in tr])
+    tt = np.concatenate([b[key] for b in tr])
+    vn = np.concatenate([b['obs_n'] for b in va])
+    vo = np.concatenate([b['obs_of'] for b in va])
+    vt = np.concatenate([b[key] for b in va])
 
-    tn = np.stack([t['obs_normal'] for t in train]).astype(np.float16)
-    to = np.stack([t['obs_oracle_full'] for t in train]).astype(np.float16)
-    tr = np.array([t['return'] for t in train], dtype=np.float32)
-    vn = np.stack([t['obs_normal'] for t in val]).astype(np.float16)
-    vo = np.stack([t['obs_oracle_full'] for t in val]).astype(np.float16)
-    vr = np.array([t['return'] for t in val], dtype=np.float32)
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.Adam(params, lr=args.critic_lr)
+    n_train = len(tt)
 
-    best_val, best_state, since_best, best_step = None, None, 0, 0
-    n = len(train)
+    best_val, best_state, since_best, best_step, stopped_at = (
+        None, None, 0, 0, None)
+    rs = args.reward_scale
+    it = 0
     for it in range(1, args.steps + 1):
-        idx = rng.integers(0, n, size=args.minibatch)
+        idx = rng.integers(0, n_train, size=args.minibatch)
         on = torch.as_tensor(tn[idx], dtype=torch.float32, device=device)
         oof = torch.as_tensor(to[idx], dtype=torch.float32, device=device)
-        ret = torch.as_tensor(tr[idx], dtype=torch.float32,
-                              device=device) / args.reward_scale
-        v = critic(torch.cat([on, oof], dim=1))
+        ret = torch.as_tensor(tt[idx], dtype=torch.float32,
+                              device=device) / rs
+        v = model(on, oof)
         loss = 0.5 * ((v - ret) ** 2).mean()
         if wd > 0:
-            loss = loss + wd * sum(torch.sum(p * p)
-                                   for p in critic.parameters())
+            loss = loss + wd * sum(torch.sum(p * p) for p in params)
         opt.zero_grad()
         loss.backward()
         opt.step()
 
         if it % args.check_every == 0:
-            vloss = _eval_loss(critic, vn, vo, vr, device, args.reward_scale)
+            vloss = _eval_loss(model, vn, vo, vt, device, rs)
             if best_val is None or vloss < best_val - 1e-6:
                 best_val, since_best, best_step = vloss, 0, it
                 best_state = {k: w.detach().cpu().clone()
-                              for k, w in critic.state_dict().items()}
+                              for k, w in model.state_dict().items()}
             else:
                 since_best += 1
                 if since_best >= args.patience:
+                    stopped_at = it
                     break
     if best_state is not None:
-        critic.load_state_dict(best_state)
+        model.load_state_dict(best_state)
 
     evs, losses = [], []
     for tb in test_batches:
-        tn_b = np.stack([t['obs_normal'] for t in tb]).astype(np.float16)
-        to_b = np.stack([t['obs_oracle_full'] for t in tb]).astype(np.float16)
-        G = np.array([t['return'] for t in tb], dtype=np.float32)
-        v = _forward(critic, tn_b, to_b, device, args.reward_scale)
-        ev = 1.0 - float((G - v).var()) / max(float(G.var()), 1e-8)
-        evs.append(ev)
-        losses.append(float(0.5 * ((v / args.reward_scale - G
-                                    / args.reward_scale) ** 2).mean()))
+        G = tb[key]
+        v = _values(model, tb['obs_n'], tb['obs_of'], device, rs)
+        evs.append(1.0 - float((G - v).var()) / max(float(G.var()), 1e-8))
+        losses.append(float(0.5 * ((v / rs - G / rs) ** 2).mean()))
     return {'best_val': best_val, 'best_step': best_step,
+            'stopped_at': stopped_at, 'n_steps': it,
             'evs': evs, 'ev_mean': float(np.mean(evs)),
             'ev_min': float(np.min(evs)), 'losses': losses}
 
@@ -171,101 +260,125 @@ def main():
     if device == 'cuda':
         print(f"[diag] GPU : {torch.cuda.get_device_name(0)}", flush=True)
     torch.set_num_threads(args.torch_threads)
-    print(f"[diag] protocole : {args.n_batches} batches ({args.train_batches}"
-          f" train / {args.val_batches} val / "
-          f"{args.n_batches - args.train_batches - args.val_batches} test), "
-          f"policy = SL figée, gamma_t=0, mode=opponent", flush=True)
 
     agent = PPOAgent(args.sl_discard, args.sl_frozen, device=device,
                      critic_lr=args.critic_lr)
-    runner = VecRunner(
-        agent, n_envs=args.n_envs, seed=args.seed,
-        grp_path=args.grp_checkpoint,
-        compute_lookahead=args.compute_lookahead, danger_labels=True,
-        mode='opponent', device=device)
 
-    # ---------------- collecte ---------------- #
-    batches = []
-    t0 = time.time()
-    for i in range(args.n_batches):
-        eps, _ = runner.collect_batch(args.batch_games, gamma_t=0.0)
-        trs = [t for ep in eps for t in ep]
-        rets = np.array([t['return'] for t in trs], dtype=np.float32)
-        n_distinct = len(np.unique(np.round(rets, 3)))
-        batches.append(trs)
-        print(f"  [{i+1:2d}/{args.n_batches}] {len(trs)} tr, "
-              f"{n_distinct} cibles distinctes (G constant/manche), "
-              f"mean={rets.mean():+.2f} var={rets.var():.1f} "
-              f"({time.time()-t0:.0f}s)", flush=True)
+    # ---------------- données : cache instrumenté requis ---------------- #
+    if not os.path.isfile(args.cache):
+        raise SystemExit(
+            f"[diag] cache introuvable : {args.cache}\n"
+            f"        v2.4 ne collecte plus : lancer d'abord "
+            f"diag_reward_structure\n"
+            f"        (il construit ce cache en ~1 h).")
+    batches = load_cache(args.cache)
 
-    n_tr, n_va = args.train_batches, args.val_batches
+    # splits : 12/4/4 sur 20 batches (v2.3) ; sinon repli proportionnel
+    n_batches = len(batches)
+    if n_batches >= 20:
+        n_tr, n_va = 12, 4
+    else:
+        n_va = max(1, min(int(0.2 * n_batches), n_batches - 3))
+        n_tr = max(1, min(int(0.6 * n_batches), n_batches - n_va - 2))
+    need = n_tr + n_va + 2
+    assert n_batches >= need, \
+        f"cache insuffisant : {n_batches} < {need} (relancer la collecte " \
+        f"avec --n-batches 20)"
+    tr, va = batches[:n_tr], batches[n_tr:n_tr + n_va]
     test_batches = batches[n_tr + n_va:]
-    assert len(test_batches) >= 2, "pas assez de batches de test"
-    train = [t for b in batches[:n_tr] for t in b]
-    val = [t for b in batches[n_tr:n_tr + n_va] for t in b]
-    print(f"[diag] splits : train={len(train)} val={len(val)} "
-          f"test={sum(len(b) for b in test_batches)} tr", flush=True)
+    print(f"[diag] splits : train={sum(len(b['rew']) for b in tr)} "
+          f"val={sum(len(b['rew']) for b in va)} "
+          f"test={sum(len(b['rew']) for b in test_batches)} tr", flush=True)
 
-    # références sur test
+    # ---------------- cibles demandées : disponibles ? ---------------- #
+    wanted = []
+    for t in args.targets.split(','):
+        t = t.strip()
+        if t not in TARGETS:
+            raise SystemExit(f"[diag] cible inconnue : {t!r} "
+                              f"(choix : {', '.join(TARGETS)})")
+        wanted.append((t, *TARGETS[t]))
+    present = set(k for k in CANON if all(k in b for b in batches))
+    missing = [k for _, k, _ in wanted if k not in present]
+    if missing:
+        raise SystemExit(
+            f"[diag] cible(s) absente(s) du cache : {missing}\n"
+            f"        ce cache ne contient que {sorted(present)}. Lancer "
+            f"diag_reward_structure (cache étendu) ou restreindre "
+            f"--targets à : {', '.join(n for n, (k, _) in
+                                        TARGETS.items() if k in present)}")
+
+    # ---------------- références ---------------- #
     print("\n[diag] références (test) :")
-    train_mean = float(np.mean([t['return'] for t in train]))
-    for k, tb in enumerate(test_batches):
-        G = np.array([t['return'] for t in tb], dtype=np.float32)
-        ev_const = 0.0   # par construction
-        ev_trmean = 1.0 - float((G - train_mean).var()) / max(G.var(), 1e-8)
-        loss_const = float(0.5 * G.var()) / args.reward_scale ** 2
-        print(f"  test[{k}] : n={len(tb)}, Var(G)={G.var():.1f}, "
-              f"EV(const)= {ev_const:+.3f}, EV(moy-train)={ev_trmean:+.3f}, "
-              f"loss(const)={loss_const:.3f}", flush=True)
+    train_means = {}
+    for key in CANON:
+        if key not in present:
+            continue
+        tm = float(np.mean([x for b in tr for x in b[key]]))
+        train_means[key] = tm
+        for k, tb in enumerate(test_batches):
+            G = tb[key]
+            print(f"  test[{k}] {CANON_LABEL[key]:12s}: n={len(G)}, "
+                  f"Var={G.var():.1f}, EV(const)=+0.000, "
+                  f"EV(moy-train)="
+                  f"{1.0 - float((G - tm).var()) / max(G.var(), 1e-8):+.3f},"
+                  f" loss(const)="
+                  f"{float(0.5 * G.var()) / args.reward_scale ** 2:.3f}",
+                  flush=True)
 
     # ---------------- sweep ---------------- #
+    variants = [v.strip() for v in args.variants.split(',')]
     wds = [float(x) for x in args.wd_list.split(',')]
-    archis = []
-    for a in args.archi_list.split(','):
-        c, b = a.split('x')
-        archis.append((int(c), int(b)))
-    print(f"\n[diag] sweep : wd x {wds} | archi x {archis} | "
+    print(f"\n[diag] sweep : variant x {variants} | target x "
+          f"{[t for t, _, _ in wanted]} | wd x {wds} | "
           f"budget {args.steps} steps, early-stop (val, patience "
           f"{args.patience})\n", flush=True)
 
-    results = []
-    for archi in archis:
-        for wd in wds:
-            r = fit_one(train, val, test_batches, wd, archi, args, device)
-            results.append((wd, archi, r))
-            print(f"  wd={wd:<6g} archi={archi[0]}x{archi[1]} : "
-                  f"val={r['best_val']:.3f}@{r['best_step']} steps | "
-                  f"EV test min/mean = {r['ev_min']:+.3f}/{r['ev_mean']:+.3f}"
-                  f" | loss test {np.mean(r['losses']):.3f}", flush=True)
+    rows = []
+    for variant in variants:
+        for tname, key, _lbl in wanted:
+            for wd in wds:
+                model = build_model_for(variant, agent, device, args.seed)
+                r = fit_one(model, tr, va, test_batches, key, wd,
+                            args, device)
+                rows.append((variant, tname, wd, r))
+                print(f"  {variant:9s} target={tname:9s} wd={wd:<7g} : "
+                      f"val={r['best_val']:.3f}@{r['best_step']} | "
+                      f"EV test min/mean = {r['ev_min']:+.3f}/"
+                      f"{r['ev_mean']:+.3f}"
+                      f" | loss test {np.mean(r['losses']):.3f}", flush=True)
 
     # ---------------- verdict ---------------- #
-    best = max(results, key=lambda x: x[2]['ev_mean'])
-    wd_b, archi_b, r_b = best
+    best = max(rows, key=lambda x: x[3]['ev_mean'])
+    v_b, t_b, wd_b, r_b = best
     print("\n" + "=" * 64)
-    print(f"[VERDICT] meilleure config : wd={wd_b:g} archi={archi_b[0]}x"
-          f"{archi_b[1]} -> EV test moyen {r_b['ev_mean']:+.3f} "
+    print(f"[VERDICT] meilleure config : {v_b} + target {t_b} + "
+          f"wd={wd_b:g} -> EV test moyen {r_b['ev_mean']:+.3f} "
           f"(min {r_b['ev_min']:+.3f})")
     if r_b['ev_mean'] >= 0.10:
-        print("[VERDICT] LE CRITIC GÉNÉRALISE. Relancer le trainer avec :")
-        print(f"          --critic-wd {wd_b:g}   (garder --adv-mode critic "
-              f"et le replay v2.1)")
-        print("          lecture attendue : part (critic) > 70%, ev > +0.10,")
-        print("          cfit ~ cval, agr stabilise >= 0.90, evaux a la "
-              "baisse d'ici 100k steps.")
+        print("[VERDICT] GO : le signal existe, la sonde le mesure.")
+        print(f"          Rapporter ce tableau + le VERDICT STRUCTURE de "
+              f"diag_reward_structure : le patch v2.4 câblera «{v_b}» et "
+              f"la cible «{t_b}» comme baseline état-dépendante dans "
+              f"compute_advantages/critic (plan D, branche critic).")
+        print("          NE PAS relancer le trainer avant ce câblage.")
     elif r_b['ev_mean'] >= 0.02:
-        print("[VERDICT] MARGINAL : la porte min_ev=0.02 passera rarement.")
-        print("          Option : relancer quand même et surveiller la part "
-              "(critic) ;")
-        print("          sinon attendre et rapporter ce tableau.")
+        print("[VERDICT] MARGINAL (la porte min_ev=0.02 passera rarement).")
+        print("          Rapporter le tableau avant toute décision :")
+        print("          en l'état, le plan D bascule sur « événements "
+              "seuls » (masque du policy loss sur les transitions non "
+              "informatives).")
     else:
-        print("[VERDICT] NON-PRÉDICTIBLE out-of-sample par ce critic.")
-        print("          NE PAS relancer en --adv-mode critic (la porte "
-              "rejetterait")
-        print("          encore tout, cf. run v2.1). Rapporter ce tableau :")
-        print("          plan B = features GRP en entrée du critic, ou "
-              "changer la cible")
-        print("          (delta de manche plutôt que G_t) — mais d'abord "
-              "mesurer, pas deviner.")
+        print("[VERDICT] NON-PRÉDICTIBLE, toutes cibles confondues.")
+        print("          Le critic est mort en régime no-oracle : la "
+              "réduction de variance par V(s) n'est PAS "
+              "disponible à cette échelle.")
+        print("          Plan D, branche « événements seuls » : masquer "
+              "le policy loss sur les transitions non informatives, "
+              "n'apprendre que sur les événements (pénalités + correction "
+              "terminale).")
+        print("          Rapporter ce tableau AVANT de relancer quoi que "
+              "ce soit.")
     print("=" * 64)
 
 
