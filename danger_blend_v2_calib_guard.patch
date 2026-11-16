@@ -1,0 +1,154 @@
+diff --git a/mahjong_ai/rl/eval_danger_blend.py b/mahjong_ai/rl/eval_danger_blend.py
+index 0260302..b5f17f2 100755
+--- a/mahjong_ai/rl/eval_danger_blend.py
++++ b/mahjong_ai/rl/eval_danger_blend.py
+@@ -5,9 +5,16 @@ Protocole pré-enregistré (avant l'entraînement de l'étape 2) :
+     tuiles légales dans un rayon τ du top-1 des logits (quasi-égalités).
+     Hors quasi-égalité l'argmax SL est inchangé : le dommage éventuel
+     au niveau de jeu est borné par construction.
+-  * p_danger = σ(tête danger(tronc SL figé(obs 279 canaux))) — proba
+-    CALIBRÉE : le checkpoint de l'étape 2 embarque déjà le décalage
+-    −log(pos_weight) dans le biais de la tête.
++  * p_danger = σ(tête danger(tronc SL figé(obs 279 canaux))) — la tête
++    doit être CALIBRÉE (clé 'calib' embarquée dans le checkpoint).
++    POST-MORTEM sweep v1 : le checkpoint entraîné n'embarquait PAS le
++    décalage −log(pos_weight) (ECE fold val 0.280 brut vs 0.005
++    calibré) — le v1 a blendé le score BCE pos_weighté, pénalités ×4
++    (q99) à ×27 (médiane) trop fortes ; la grille λ pré-enregistrée « en
++    unités de proba » n'a jamais été testée. Le sweep REFUSE donc une
++    tête sans clé 'calib' (échappatoire --allow-raw-p, déconseillé) :
++    passer la copie calibrée danger_head_cal.pt produite par
++    audit_danger_head.py --fix-out.
+   * sweep (τ, λ) sur l'éval APPARIÉE : 384 parties, seed 777, chunks
+     de 32, adversaires 3 × SL argmax, siège agent argmax, lookahead ON
+     — les conditions EXACTES de la référence mr = 2.484 ± 0.113.
+@@ -28,15 +35,32 @@ env -> les donnes (murs + sièges agent) sont IDENTIQUES dans tous les
+ bras ; les stats portent env_idx -> comparaisons appariées par partie
+ (rangs, dng) + bootstrap apparié.
+ 
+-Usage (racine du repo ; défaut = baseline + 9 bras τ×λ = 10 bras,
+-~36 min/bras sur RTX 2060 -> ~6 h ; préversion : --games 96 ~1,5 h) :
++Usage (racine du repo ; SWEEP V2 = tête calibrée, λ en unités de
++proba ; ~36 min/bras à 384p sur RTX 2060, ~9 min à 96p) :
++    # 0) une fois : copie calibrée (audit partie 2 + fix-out vérifié)
++    py -3.14 audit_danger_head.py --data checkpoints/danger_data ^
++      --fix-out checkpoints/danger_head/danger_head_cal.pt
++
++    # v2a - grille pré-enregistrée, ENFIN en probas (13 bras x 96p)
+     py -3.14 -m mahjong_ai.rl.eval_danger_blend ^
+-      --danger-head checkpoints/danger_head/danger_head.pt ^
++      --danger-head checkpoints/danger_head/danger_head_cal.pt ^
+       --sl-discard checkpoints/sl_tonpusen_la/discard.pt ^
+       --sl-frozen checkpoints/sl_tonpusen_la ^
+       --grp checkpoints/grp_tonpusen.pt ^
+-      --games 384 --chunk-size 32 --seed 777 ^
+-      --out checkpoints/danger_blend_sweep
++      --lams 0.5,1,2,4 --taus 1,2,4 --games 96 --seed 777 ^
++      --out checkpoints/danger_blend_sweep_v2a
++
++    # v2b - ponts vers les forces v1 (λ_cal 32 ≈ ancien λ_brut 1 en
++    #        médiane ; τ=1 seul : τ est inerte à petit λ)
++    py -3.14 -m mahjong_ai.rl.eval_danger_blend ^
++      --danger-head checkpoints/danger_head/danger_head_cal.pt ^
++      --lams 8,16,32,64 --taus 1 --games 96 --seed 777 ^
++      --out checkpoints/danger_blend_sweep_v2b
++
++    # analyse appariée (aucun GPU requis), puis confirmation du/des
++    # gagnants à --games 384 pour la porte pré-enregistrée
++    py -3.14 analyze_danger_blend_results.py ^
++      --in checkpoints/danger_blend_sweep_v2a/results.json
+ 
+ Le GRP n'altère pas les dynamiques (récompenses seules, inutilisées à
+ l'éval) mais on le passe identique à la run de référence, par prudence.
+@@ -68,11 +92,16 @@ class DangerBlendAgent(PPOAgent):
+     l'agent (sl_discard.trunk), EXACTEMENT la fonction feature de
+     l'entraînement de la tête — indépendant de la policy chargée.
+ 
++    p doit être une PROBA CALIBRÉE (clé 'calib' du checkpoint danger) :
++    le constructeur REFUSE une tête brute (score BCE pos_weighté, le
++    bug du sweep v1) sauf allow_raw_p=True.
++
+     Blend actif uniquement en mode déterministe (déploiement argmax) :
+     en échantillonné ou blend_active=False, comportement PPOAgent pur.
+     """
+ 
+-    def __init__(self, danger_head_path, tau=2.0, lam=4.0, **kwargs):
++    def __init__(self, danger_head_path, tau=2.0, lam=4.0,
++                 allow_raw_p=False, **kwargs):
+         super().__init__(**kwargs)
+         ck = torch.load(danger_head_path, map_location=self.device,
+                         weights_only=False)
+@@ -89,6 +118,23 @@ class DangerBlendAgent(PPOAgent):
+                     f"[blend] config danger_head {k}={cfg.get(k)} != SL "
+                     f"({mine}) -- couple checkpoint SL / tête danger "
+                     f"incohérent")
++        # [v2] garde calibration : sans clé 'calib', σ(sortie) est le score
++        # BCE pos_weighté (odds ×pos_weight), PAS une probabilité — le
++        # sweep v1 a blendé ce score (pénalités ×4 à ×27, porte échouée).
++        calib = ck.get('calib')
++        if calib is None and not allow_raw_p:
++            raise SystemExit(
++                f"[blend] {danger_head_path} n'embarque pas de clé 'calib' "
++                f"(pos_weight={ck.get('pos_weight', '?')}) : σ(sortie de "
++                f"tête) est le score BCE pos_weighté, PAS une probabilité "
++                f"— c'est exactement le bug du sweep v1 (ECE 0.280 brut vs "
++                f"0.005 calibré, pénalités ×4 à ×27 trop fortes). Produire "
++                f"la copie calibrée, puis la passer à --danger-head :\n"
++                f"    py -3.14 audit_danger_head.py --data "
++                f"checkpoints\\danger_data --fix-out "
++                f"checkpoints\\danger_head\\danger_head_cal.pt\n"
++                f"(forcer ce checkpoint brut malgré tout : --allow-raw-p, "
++                f"déconseillé — répète le bug v1)")
+         self.danger_head = DangerHead(self.arch['channels'],
+                                       cfg.get('hidden', 128)).to(self.device)
+         self.danger_head.load_state_dict(ck['head'])
+@@ -103,8 +149,12 @@ class DangerBlendAgent(PPOAgent):
+         met = ck.get('metrics', {})
+         print(f"[blend] tête danger chargée (AUC val "
+               f"{met.get('auc', '?')}, ECE {met.get('ece', '?')}, "
+-              f"calib embarquée {ck.get('calib', {}).get('method', '?')})",
+-              flush=True)
++              f"calib embarquée "
++              f"{(calib or {}).get('method', 'ABSENTE')})", flush=True)
++        if calib is None:
++            print("[blend] ATTENTION : p BRUT non calibré (--allow-raw-p) "
++                  "— λ·p s'applique en unités du score pos_weighté, pas "
++                  "en probabilités (conditions du sweep v1)", flush=True)
+ 
+     def reset_counters(self):
+         self.n_blend_decisions = 0
+@@ -248,7 +298,13 @@ def main():
+                     'pré-enregistrée : dng% −20% ET Δmr <= +0.05)')
+     p.add_argument('--danger-head',
+                    default='checkpoints/danger_head/danger_head.pt',
+-                   help='checkpoint de l\'étape 2 (tête + calib)')
++                   help='checkpoint danger_head CALIBRÉ (clé calib) : la '
++                        'copie danger_head_cal.pt de '
++                        'audit_danger_head.py --fix-out')
++    p.add_argument('--allow-raw-p', action='store_true',
++                   help='(déconseillé) autoriser une tête danger sans '
++                        'clé calib : λ·p s\'applique alors au score BCE '
++                        'pos_weighté — le bug du sweep v1')
+     p.add_argument('--sl-discard',
+                    default='checkpoints/sl_tonpusen_la/discard.pt')
+     p.add_argument('--sl-frozen',
+@@ -268,8 +324,9 @@ def main():
+                    help='liste des τ (rayon de quasi-égalité en logits), '
+                         'séparés par des virgules')
+     p.add_argument('--lams', default='1,4,16',
+-                   help='liste des λ (poids de p_danger), séparés par des '
+-                        'virgules')
++                   help='liste des λ (poids de p_danger CALIBRÉE, unités '
++                        'de proba), séparés par des virgules ; v2a '
++                        'recommandé : 0.5,1,2,4 ; ponts v1 : 8,16,32,64')
+     p.add_argument('--gate-dng', type=float, default=0.20,
+                    help='porte : réduction relative minimale de dng%%')
+     p.add_argument('--gate-mr', type=float, default=0.05,
+@@ -292,6 +349,7 @@ def main():
+ 
+     agent = DangerBlendAgent(
+         args.danger_head, tau=taus[0], lam=lams[0],
++        allow_raw_p=args.allow_raw_p,
+         sl_discard_path=args.sl_discard, sl_frozen_dir=args.sl_frozen,
+         device=device)
+ 
