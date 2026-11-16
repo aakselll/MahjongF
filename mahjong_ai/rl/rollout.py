@@ -64,13 +64,14 @@ def load_grp_predictor(path, device='cpu'):
 
 class _Slot:
     """État d'une partie en cours."""
-    __slots__ = ('env', 'req', 'agent_seat', 'transitions',
+    __slots__ = ('env', 'idx', 'req', 'agent_seat', 'transitions',
                  'pending_reward', 'round_idx_per_seat', 'round_counter',
                  'grp_delta_sum', 'max_honba', 'stats',
                  'env_stats_before')
 
-    def __init__(self, env, agent_seat):
+    def __init__(self, env, agent_seat, idx=0):
         self.env = env
+        self.idx = idx                    # [ÉTAPE 3] id d'env (appariement)
         self.agent_seat = agent_seat      # None en self-play
         self.req = None
         self.transitions = []
@@ -92,6 +93,7 @@ class _Slot:
         self.grp_delta_sum = {s: 0.0 for s in range(4)}
         self.max_honba = 0
         self.stats = {
+            'env_idx': self.idx,          # [ÉTAPE 3] clé d'appariement
             'n_rounds': 0, 'n_tsumo': 0, 'n_ron': 0, 'n_exhaustive': 0,
             'n_abortive': 0, 'n_unhandled': 0, 'n_rl_discards': 0,
             'n_danger_discards': 0,
@@ -162,7 +164,7 @@ class VecRunner:
             env.round_env.frozen_sl = None  # TOUTES les requêtes nous
             #                                   sont yieldées (batching)
             env.round_env.compute_danger = danger_labels
-            self.slots.append(_Slot(env, agent_seat=None))
+            self.slots.append(_Slot(env, agent_seat=None, idx=i))
         self.seat_rng = np.random.RandomState((seed or 0) + 7777)
         la_str = 'ON' if compute_lookahead else (
             "OFF (80 canaux lookahead mis a zero a l'execution : OK "
@@ -312,6 +314,14 @@ class VecRunner:
         req = slot.req
         if ex is None:
             return
+        # [ÉTAPE 3] comptage dng% AUSSI en mode éval (collect=False) :
+        # l'instrumentation de eval_matchup restait muette car ce bloc
+        # n'était atteint qu'en collecte. Instrumentation pure (stats
+        # déjà existantes), zéro effet sur dynamiques/récompenses.
+        if ex['danger'] is not None:
+            slot.stats['n_rl_discards'] += 1
+            if float(ex['danger'][action]) > 0:
+                slot.stats['n_danger_discards'] += 1
         if not collect:
             return
         seat = req['seat']
@@ -319,11 +329,8 @@ class VecRunner:
         # dans la manche précédente) + pénalité danger éventuelle
         carried = slot.pending_reward[seat]
         slot.pending_reward[seat] = 0.0
-        if ex['danger'] is not None:
-            slot.stats['n_rl_discards'] += 1
-            if float(ex['danger'][action]) > 0:
-                slot.stats['n_danger_discards'] += 1
-                carried -= danger_penalty
+        if ex['danger'] is not None and float(ex['danger'][action]) > 0:
+            carried -= danger_penalty
         tr = {
             'seat': seat,
             'round': slot.round_counter,

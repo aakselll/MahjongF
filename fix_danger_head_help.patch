@@ -1,0 +1,13 @@
+diff --git a/mahjong_ai/rl/train_danger_head.py b/mahjong_ai/rl/train_danger_head.py
+index 78c7af4..b3cd785 100644
+--- a/mahjong_ai/rl/train_danger_head.py
++++ b/mahjong_ai/rl/train_danger_head.py
+@@ -297,7 +297,7 @@ def main():
+     ap.add_argument('--wd', type=float, default=1e-4)
+     ap.add_argument('--hidden', type=int, default=128)
+     ap.add_argument('--val-fold', type=int, default=0,
+-                    help=f'parties avec game % {N_FOLDS} == fold -> val '
++                    help=f'parties avec game %% {N_FOLDS} == fold -> val '
+                          f'(split PAR PARTIE, défaut 0)')
+     ap.add_argument('--pos-weight-cap', type=float, default=50.0)
+     ap.add_argument('--gate-auc', type=float, default=0.75,

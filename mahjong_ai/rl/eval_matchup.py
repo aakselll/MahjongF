@@ -23,6 +23,14 @@ gamma=0, aucune transition collectée) mais :
               avec ou sans, mais on ne veut pas dépendre de cet
               argument théorique).
 
+[V2.5] [PLAN DANGER] instrumentation dng% : le runner passe en
+  danger_labels=True (labels contrefactuels par tuile du siège agent,
+  calcul pur depuis les mains cachées — AUCUN effet sur les dynamiques
+  ni sur l'appariement par --seed, danger_penalty reste 0) et le
+  résultat affiche « dng% siège agent ». À mesurer UNE fois sur la
+  baseline SL avec la même seed : c'est la référence de la porte de
+  l'étape 3 (blend danger sur les quasi-égalités).
+
 Usage (racine du repo) :
   # baseline argmax : la policy reste à l'init SL (référence 2.50)
   py -3.14 -m mahjong_ai.rl.eval_matchup ^
@@ -59,7 +67,12 @@ def evaluate_chunk(agent, chunk, seed, device, compute_lookahead,
     """Un chunk = `chunk` envs neufs, une partie chacun (appariement exact)."""
     runner = VecRunner(agent, n_envs=chunk, seed=seed, grp_path=grp_path,
                        compute_lookahead=compute_lookahead,
-                       danger_labels=False, mode='opponent', device=device)
+                       # [PLAN DANGER] labels contrefactuels par tuile
+                       # (siège agent) : calcul pur, aucun effet sur les
+                       # dynamiques/récompenses (danger_penalty=0) ni sur
+                       # l'appariement par --seed -> mr comparables aux
+                       # anciens runs.
+                       danger_labels=True, mode='opponent', device=device)
     _, stats = runner.collect_batch(
         chunk, gamma_t=0.0, deterministic=not sampled, collect=False,
         gamma_override=0.0)
@@ -125,6 +138,7 @@ def main():
     n_chunks = (args.games + chunk - 1) // chunk
     ranks, n_rounds, ends = [], [], {'tsumo': 0, 'ron': 0,
                                      'exhaustive': 0, 'abortive': 0}
+    n_rd, n_dd = 0, 0    # [PLAN DANGER] défausses / défausses dangereuses
     t0 = __import__('time').time()
     for c in range(n_chunks):
         n_here = min(chunk, args.games - c * chunk)
@@ -134,6 +148,8 @@ def main():
         for s in stats:
             ranks.append(s['rank_of_seat0'])
             n_rounds.append(s['n_rounds'])
+            n_rd += s.get('n_rl_discards', 0)
+            n_dd += s.get('n_danger_discards', 0)
             for k in ends:
                 ends[k] += s.get(f'n_{k}', 0)
         done = (c + 1) * chunk
@@ -154,6 +170,9 @@ def main():
     print(f"[eval] fins : tsumo%={100*ends['tsumo']/tot_ends:.0f} "
           f"ron%={100*ends['ron']/tot_ends:.0f} "
           f"exh%={100*ends['exhaustive']/tot_ends:.0f}")
+    if n_rd:    # [PLAN DANGER] même définition que le dng% du trainer
+        print(f"[eval] dng% siège agent : {100.0 * n_dd / n_rd:.2f} "
+              f"({n_dd}/{n_rd} défausses)")
     print(f"[eval] siège agent {mode_str} ; baseline SL argmax attendue "
           f"~2.50 ; même --seed entre deux évals = comparaison appariée",
           flush=True)
