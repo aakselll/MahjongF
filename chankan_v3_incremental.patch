@@ -1,0 +1,216 @@
+--- a/mahjong_ai/rl/rollout.py
++++ b/mahjong_ai/rl/rollout.py
+@@ -115,6 +115,8 @@
+             # honba, chankan) -- cf. _after_step
+             'n_dealins_paid': 0, 'points_paid': 0.0,
+             'n_ron_paid_nodanger': 0,
++            # [DIAG v3] chankans payés (ron adverse sur MON shouminkan)
++            'n_chankan_paid': 0, 'points_chankan': 0.0,
+         }
+         self.env_stats_before = self.env.get_stats()
+         self.req = self.env.reset_round()
+@@ -448,22 +450,35 @@
+         # perdu (le -1000 est prélevé dans final_rewards pour TOUTE fin
+         # de manche, cf. _final de game_env), honba, ou chankan ->
+         # compté à part. (diag v1 sur 96 donnes : 11 des 72 "deal-ins"
+-        # étaient des batons ~-1000 pts ; 19 des 80 lbl n'ont jamais été
+-        # ronnés -- mains yakuless, le label ignore le yaku par
+-        # construction, cf. _danger_labels.)
++        # étaient des CHANKANS -- rons sur le shouminkan de l'agent,
++        # mains réelles -2.8/-4.9/-6.8, cf. clé is_chankan [DIAG v3] ;
++        # 19 des 80 lbl n'ont jamais été ronnés -- mains yakuless, le
++        # label ignore le yaku par construction, cf. _danger_labels.)
+         pay = (float(round_rewards.get(slot.agent_seat, 0.0))
+                if slot.agent_seat is not None else 0.0)
+         ronish = outcome in ('ron', 'multi_ron')
++        # [DIAG v3] chankan : ron adverse sur le SHOUMINKAN de l'agent
++        # (clé additive posée par l'env). Paiement réel mais NI un
++        # deal-in de défausse (la tuile fatale est celle du KAN, pas la
++        # dernière défausse -- d'où les fantômes v1 "dealt_in sans
++        # label"), NI un baton riichi : compté à part.
++        ckan = bool(result.get('is_chankan', False))
+         paid_ron = (ronish or outcome == 'chankan') and pay < 0.0
+         if paid_ron:
+-            if slot.last_discard_danger:
++            if ckan:
++                slot.stats['n_chankan_paid'] += 1
++                slot.stats['points_chankan'] += float(pay)
++            elif slot.last_discard_danger:
+                 slot.stats['n_dealins_paid'] += 1
+                 slot.stats['points_paid'] += float(pay)
+             else:
+                 slot.stats['n_ron_paid_nodanger'] += 1
+         if self.diag_active and slot.diag_round_rows:
+             if ronish and pay < 0.0:
+-                if slot.last_discard_danger:
++                if ckan:
++                    slot.diag_round_rows[-1]['chankan_paid'] = True
++                    slot.diag_round_rows[-1]['chankan_points'] = pay
++                elif slot.last_discard_danger:
+                     slot.diag_round_rows[-1]['dealt_in'] = True
+                     slot.diag_round_rows[-1]['points_paid'] = pay
+                 else:
+--- a/mahjong_ai/rl/diag_dealins.py
++++ b/mahjong_ai/rl/diag_dealins.py
+@@ -33,11 +33,13 @@
+ défausse de la manche est marquée dealt_in avec les points payés.
+ 
+ Contrôles d'intégrité embarqués :
+-  * dealt_in ⟹ danger[action] > 0 [v2 : le marquage EXIGE que la
+-    dernière défausse de la manche soit lbl-danger ; diag v1 : 11/72
+-    "deal-ins" étaient des batons riichi perdus sur le ron d'un autre
+-    (-1000 prélevé dans final_rewards à TOUTE fin de manche, cf. _final
+-    de game_env) -> comptés stick_lost à part] ; réciproque FAUSSE :
++  * dealt_in ⟹ danger[action] > 0 [v2/v3 : le marquage EXIGE que la
++    dernière défausse de la manche soit lbl-danger ET que le ron ne
++    soit pas un chankan (clé is_chankan de l'env) ; diag v1 : 11/72
++    "deal-ins" étaient des CHANKANS -- rons adverses sur le
++    shouminkan de l'agent, comptés à tort sur la dernière défausse
++    (points -2.8/-4.9/-6.8 = mains réelles, pas des batons -1.0) ->
++    comptés chankan_paid à part] ; réciproque FAUSSE :
+     danger[action] sans ron = adversaire tenpai non-furiten mais
+     YAKULESS (le label contrefactuel ignore le yaku par construction,
+     cf. _danger_labels) -> tuile lbl non payable ;
+@@ -237,6 +239,13 @@
+                                dtype=bool),
+         'stick_pts': np.array([r.get('stick_points', 0.0) for r in rows],
+                               dtype=np.float64),
++        # [DIAG v3] chankans payés (ron adverse sur MON shouminkan,
++        # clé is_chankan de l'env) : pertes réelles, imputables à la
++        # décision KONG, pas à une défausse
++        'chankan_paid': np.array([r.get('chankan_paid', False) for r in rows],
++                                 dtype=bool),
++        'chankan_pts': np.array([r.get('chankan_points', 0.0) for r in rows],
++                                dtype=np.float64),
+         'chunk': np.array([r['chunk'] for r in rows], dtype=np.int64),
+         'env': np.array([r['env_idx'] for r in rows], dtype=np.int64),
+         'round': np.array([r['round'] for r in rows], dtype=np.int64),
+@@ -280,13 +289,20 @@
+     ghost = dd & ~dat['lbl_dd']
+     yakuless = dat['lbl_dd'] & ~dd
+     n_paid = int(paid.sum())
++    ckan = dat.get('chankan_paid', np.zeros(N, bool))
++    n_ckan = int(ckan.sum())
+     rep['n_dealins_paid'] = n_paid
++    rep['n_chankan_paid'] = n_ckan
+     rep['integrity'] = {
+         'dealt_in_sans_label': int(ghost.sum()),
+         'label_sans_deal_in_yakuless': int(yakuless.sum()),
+         'n_sticks': int(dat['stick_lost'].sum()),
+         'stick_points': float(
+             dat['stick_pts'][dat['stick_lost']].sum()),
++        'n_chankan': n_ckan,
++        'chankan_points': float(
++            dat['chankan_pts'][ckan].sum()) if 'chankan_pts' in dat
++        else 0.0,
+     }
+     rep['integrity_mismatch'] = int((dat['lbl_dd'] != dd).sum())
+ 
+@@ -386,12 +402,17 @@
+           f"({100 * n_paid / max(N, 1):.2f}%)", flush=True)
+     n_gh = int(integ.get('dealt_in_sans_label', 0))
+     n_stick = max(n_gh, int(integ.get('n_sticks', 0)))
++    n_ck = int(integ.get('n_chankan', 0))
++    if n_ck:
++        print(f"[diag] CHANKANS payés (ron adverse sur MON shouminkan) : "
++              f"{n_ck} manches, {integ.get('chankan_points', 0.0):.1f} pts "
++              f"-- pertes réelles imputables à la décision KONG, pas aux "
++              f"défausses (le diag v1 les comptait comme deal-ins de la "
++              f"dernière défausse : 11/72)", flush=True)
+     if n_stick:
+-        print(f"[diag] paiements NON imputables à une défausse (baton "
+-              f"riichi perdu / honba) : {n_stick} manches, "
+-              f"{integ.get('stick_points', 0.0):.1f} pts -- comptés à "
+-              f"part, PAS des deal-ins (bug du diag v1 : 11/72)",
+-              flush=True)
++        print(f"[diag] paiements NON imputables restants (baton riichi "
++              f"perdu / honba) : {n_stick} manches, "
++              f"{integ.get('stick_points', 0.0):.1f} pts", flush=True)
+     print(f"[diag] intégrité : dealt_in sans label : {n_gh}"
+           + (" (ATTENDU 0 avec le marquage v2 !)" if n_gh
+              else " (ok)")
+@@ -593,6 +614,8 @@
+         points=dat['points'].astype(np.float32),
+         stick_lost=dat['stick_lost'],
+         stick_pts=dat['stick_pts'].astype(np.float32),
++        chankan_paid=dat['chankan_paid'],
++        chankan_pts=dat['chankan_pts'].astype(np.float32),
+         chunk=dat['chunk'], env=dat['env'], round=dat['round'])
+     summary_path = os.path.join(args.out, 'diag_summary.json')
+     rep = analyze(dat, taus, lams, args.p_blind, out_json=summary_path)
+--- a/mahjong_ai/rl/eval_danger_blend.py
++++ b/mahjong_ai/rl/eval_danger_blend.py
+@@ -247,13 +247,20 @@
+                  for s in per_game.values())
+     pts_paid = sum(float(s.get('points_paid', 0.0))
+                    for s in per_game.values())
++    # [v3] chankans payés (ron adverse sur le shouminkan de l'agent) :
++    # surveillance -- le blend ne touche pas les kans, mais le futur
++    # garde-fou kong (--danger-head sur KONG_YES) aura cette référence
++    n_ckan = sum(int(s.get('n_chankan_paid', 0)) for s in per_game.values())
++    pts_ckan = sum(float(s.get('points_chankan', 0.0))
++                   for s in per_game.values())
+     se = (float(ranks.std(ddof=1) / np.sqrt(len(ranks)))
+           if len(ranks) > 1 else 0.0)
+     return {'mr': float(ranks.mean()), 'mr_ic95': 1.96 * se,
+             'wr': float((ranks == 1).mean()), 'n_rd': n_rd, 'n_dd': n_dd,
+             'dng_pct': 100.0 * n_dd / max(n_rd, 1),
+             'n_dpid': n_dpid, 'paid_pct': 100.0 * n_dpid / max(n_rd, 1),
+-            'pts_paid': float(pts_paid)}
++            'pts_paid': float(pts_paid),
++            'n_ckan': n_ckan, 'pts_ckan': float(pts_ckan)}
+ 
+ 
+ def paired_compare(base, arm, n_boot=2000, seed=777):
+@@ -417,7 +424,9 @@
+                       f"(±{s['mr_ic95']:.3f}) wr={s['wr']:.3f} | "
+                       f"dng {s['dng_pct']:.2f}% ({s['n_dd']}/{s['n_rd']}) "
+                       f"| PAYÉS {s['n_dpid']} ({s['paid_pct']:.2f}%, "
+-                      f"{s['pts_paid']:.0f} pts)", flush=True)
++                      f"{s['pts_paid']:.0f} pts) | chankans "
++                      f"{s['n_ckan']} ({s['pts_ckan']:.0f} pts)",
++                      flush=True)
+                 dev = s['mr'] - REF_MR
+                 print(f"[sweep] contrôle non-régression : mr - {REF_MR} = "
+                       f"{dev:+.3f} (attendu +0.000 si mêmes réglages que "
+@@ -464,7 +473,9 @@
+                              'rd': int(g['n_rl_discards']),
+                              'dd': int(g['n_danger_discards']),
+                              'dpid': int(g.get('n_dealins_paid', 0)),
+-                             'pts': float(g.get('points_paid', 0.0))}
++                             'pts': float(g.get('points_paid', 0.0)),
++                             'ckan': int(g.get('n_chankan_paid', 0)),
++                             'ckpts': float(g.get('points_chankan', 0.0))}
+                 for (c, e), g in per_game.items()}
+             with open(results_path, 'w', encoding='utf-8') as f:
+                 json.dump(results, f, indent=2, ensure_ascii=False)
+--- a/mahjong_ai/envs/multi_agent.py
++++ b/mahjong_ai/envs/multi_agent.py
+@@ -1091,8 +1091,25 @@
+                                             for s in range(4):
+                                                 final_rewards[s] += payment[s]
+                                         outcome = "multi_ron" if len(chankan_ronners) > 1 else "ron"
+-                                        return self._final(prev_pending[0], prev_pending[1],
+-                                                           final_rewards, outcome)
++                                        # [DIAG v3] clé ADDITIVE : ce ron est
++                                        # un CHANKAN (sur le shouminkan de
++                                        # `seat`). Le runner distingue ce
++                                        # paiement (imputable au KAN, pas à
++                                        # une défausse) du deal-in de défausse
++                                        # et du baton riichi : le diag v1
++                                        # comptait les chankans comme deal-ins
++                                        # de la dernière défausse (11 des 72
++                                        # "deal-ins" sur 96 donnes v2b --
++                                        # points -2.8/-4.9/-6.8 = mains
++                                        # réelles, pas des batons -1.0).
++                                        # Dynamique inchangée : la clé
++                                        # n'est lue par personne dans l'env.
++                                        res = self._final(prev_pending[0],
++                                                          prev_pending[1],
++                                                          final_rewards,
++                                                          outcome)
++                                        res['is_chankan'] = True
++                                        return res
+ 
+                             abort = self._check_abortive_draw()
+ 

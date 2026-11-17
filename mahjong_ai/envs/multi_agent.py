@@ -1091,8 +1091,25 @@ class MultiAgentMahjongEnv:
                                             for s in range(4):
                                                 final_rewards[s] += payment[s]
                                         outcome = "multi_ron" if len(chankan_ronners) > 1 else "ron"
-                                        return self._final(prev_pending[0], prev_pending[1],
-                                                           final_rewards, outcome)
+                                        # [DIAG v3] clé ADDITIVE : ce ron est
+                                        # un CHANKAN (sur le shouminkan de
+                                        # `seat`). Le runner distingue ce
+                                        # paiement (imputable au KAN, pas à
+                                        # une défausse) du deal-in de défausse
+                                        # et du baton riichi : le diag v1
+                                        # comptait les chankans comme deal-ins
+                                        # de la dernière défausse (11 des 72
+                                        # "deal-ins" sur 96 donnes v2b --
+                                        # points -2.8/-4.9/-6.8 = mains
+                                        # réelles, pas des batons -1.0).
+                                        # Dynamique inchangée : la clé
+                                        # n'est lue par personne dans l'env.
+                                        res = self._final(prev_pending[0],
+                                                          prev_pending[1],
+                                                          final_rewards,
+                                                          outcome)
+                                        res['is_chankan'] = True
+                                        return res
 
                             abort = self._check_abortive_draw()
 

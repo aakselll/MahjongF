@@ -1,0 +1,447 @@
+--- a/mahjong_ai/rl/rollout.py
++++ b/mahjong_ai/rl/rollout.py
+@@ -68,7 +68,7 @@
+                  'pending_reward', 'round_idx_per_seat', 'round_counter',
+                  'grp_delta_sum', 'max_honba', 'stats',
+                  'env_stats_before', 'diag_all', 'diag_rounds',
+-                 'diag_round_rows')
++                 'diag_round_rows', 'last_discard_danger')
+ 
+     def __init__(self, env, agent_seat, idx=0):
+         self.env = env
+@@ -87,6 +87,10 @@
+         self.diag_all = []
+         self.diag_rounds = []
+         self.diag_round_rows = []
++        # [DIAG v2] la DERNIÈRE défausse RL de la manche courante
++        # était-elle dangereuse (label contrefactuel) ? Base du marquage
++        # dealt_in et des compteurs "deal-ins payés" (voir _after_step).
++        self.last_discard_danger = False
+ 
+     def new_game(self, agent_seat):
+         self.agent_seat = agent_seat
+@@ -100,11 +104,17 @@
+         self.diag_all = []
+         self.diag_rounds = []
+         self.diag_round_rows = []
++        self.last_discard_danger = False
+         self.stats = {
+             'env_idx': self.idx,          # [ÉTAPE 3] clé d'appariement
+             'n_rounds': 0, 'n_tsumo': 0, 'n_ron': 0, 'n_exhaustive': 0,
+             'n_abortive': 0, 'n_unhandled': 0, 'n_rl_discards': 0,
+             'n_danger_discards': 0,
++            # [DIAG v2] deal-ins RÉELLEMENT payés (ron sur MA défausse
++            # dangereuse) vs paiements non imputables (baton riichi,
++            # honba, chankan) -- cf. _after_step
++            'n_dealins_paid': 0, 'points_paid': 0.0,
++            'n_ron_paid_nodanger': 0,
+         }
+         self.env_stats_before = self.env.get_stats()
+         self.req = self.env.reset_round()
+@@ -353,6 +363,10 @@
+             slot.stats['n_rl_discards'] += 1
+             if float(ex['danger'][action]) > 0:
+                 slot.stats['n_danger_discards'] += 1
++            # [DIAG v2] mémorisé pour la fin de manche : le ron payé
++            # n'est un deal-in QUE si la dernière défausse était
++            # dangereuse (instrumentation pure, zéro dynamique)
++            slot.last_discard_danger = float(ex['danger'][action]) > 0
+             # [DIAG DEAL-INS] enrichit la ligne rendue par l'agent avec
+             # ce que seul le runner connaît (label danger contrefactuel
+             # 34 voies, masque, action) ; inert sans diag.
+@@ -426,21 +440,43 @@
+                 slot.pending_reward[s] += r_s
+         slot.round_idx_per_seat = {s: [] for s in range(4)}
+ 
+-        # [DIAG DEAL-INS] fin de manche : si l'agent a PAYÉ un ron, sa
+-        # dernière défausse de la manche est la tuile fatale (les requêtes
+-        # RON sont toujours acceptées -> label danger[action] == deal-in).
+-        # pay < 0 en unités reward (score de manche /1000).
++        # [DIAG v2] fin de manche. pay < 0 sur une issue en ron n'est un
++        # DEAL-IN de l'agent QUE si sa dernière défausse de manche était
++        # dangereuse (danger[action] > 0 -- les requêtes RON adverses
++        # sont toujours acceptées -> ron réel ⟹ label positif). Sinon le
++        # paiement n'est PAS imputable à une défausse : baton riichi
++        # perdu (le -1000 est prélevé dans final_rewards pour TOUTE fin
++        # de manche, cf. _final de game_env), honba, ou chankan ->
++        # compté à part. (diag v1 sur 96 donnes : 11 des 72 "deal-ins"
++        # étaient des batons ~-1000 pts ; 19 des 80 lbl n'ont jamais été
++        # ronnés -- mains yakuless, le label ignore le yaku par
++        # construction, cf. _danger_labels.)
++        pay = (float(round_rewards.get(slot.agent_seat, 0.0))
++               if slot.agent_seat is not None else 0.0)
++        ronish = outcome in ('ron', 'multi_ron')
++        paid_ron = (ronish or outcome == 'chankan') and pay < 0.0
++        if paid_ron:
++            if slot.last_discard_danger:
++                slot.stats['n_dealins_paid'] += 1
++                slot.stats['points_paid'] += float(pay)
++            else:
++                slot.stats['n_ron_paid_nodanger'] += 1
+         if self.diag_active and slot.diag_round_rows:
+-            pay = (float(round_rewards.get(slot.agent_seat, 0.0))
+-                   if slot.agent_seat is not None else 0.0)
+-            if outcome in ('ron', 'multi_ron') and pay < 0.0:
+-                slot.diag_round_rows[-1]['dealt_in'] = True
+-                slot.diag_round_rows[-1]['points_paid'] = pay
++            if ronish and pay < 0.0:
++                if slot.last_discard_danger:
++                    slot.diag_round_rows[-1]['dealt_in'] = True
++                    slot.diag_round_rows[-1]['points_paid'] = pay
++                else:
++                    # baton riichi perdu sur le ron d'un autre (ou honba)
++                    # : paiement réel mais PAS un deal-in de défausse
++                    slot.diag_round_rows[-1]['stick_lost'] = True
++                    slot.diag_round_rows[-1]['stick_points'] = pay
+             slot.diag_rounds.append(
+                 {'round': slot.round_counter, 'outcome': outcome,
+                  'agent_pay': pay, 'n_rows': len(slot.diag_round_rows)})
+             slot.diag_all.extend(slot.diag_round_rows)
+             slot.diag_round_rows = []
++        slot.last_discard_danger = False
+ 
+         if result.get('game_done', False):
+             # rewards pending -> dernière transition du siège
+--- a/mahjong_ai/rl/diag_dealins.py
++++ b/mahjong_ai/rl/diag_dealins.py
+@@ -33,8 +33,14 @@
+ défausse de la manche est marquée dealt_in avec les points payés.
+ 
+ Contrôles d'intégrité embarqués :
+-  * dealt_in ⟺ danger[action] > 0 (les requêtes RON sont toujours
+-    acceptées par le runner -> label contrefactuel == deal-in réel) ;
++  * dealt_in ⟹ danger[action] > 0 [v2 : le marquage EXIGE que la
++    dernière défausse de la manche soit lbl-danger ; diag v1 : 11/72
++    "deal-ins" étaient des batons riichi perdus sur le ron d'un autre
++    (-1000 prélevé dans final_rewards à TOUTE fin de manche, cf. _final
++    de game_env) -> comptés stick_lost à part] ; réciproque FAUSSE :
++    danger[action] sans ron = adversaire tenpai non-furiten mais
++    YAKULESS (le label contrefactuel ignore le yaku par construction,
++    cf. _danger_labels) -> tuile lbl non payable ;
+   * --check-sweep : n_rd / n_dd / rang par donne rejoués vs le bras
+     baseline d'un results.json de sweep v2 -> le rejouage doit être
+     EXACT (même seed, mêmes graines d'envs, mêmes actions argmax).
+@@ -50,6 +56,8 @@
+ <out>/diag_summary.json + rapport console. Les p sont CELLES de la tête
+ calibrée (le checkpoint doit embarquer la clé 'calib' ; pas
+ d'échappatoire ici : tout le diagnostic lit des probabilités).
++Post-analyse d'un npz EXISTANT (ciblage tête v2, sans GPU, 5 s) :
++    py -3.14 analyze_danger_diag.py --npz <out>\\diag_dealins.npz
+ """
+ import argparse
+ import json
+@@ -223,6 +231,12 @@
+                              dtype=bool),
+         'points': np.array([r.get('points_paid', 0.0) for r in rows],
+                            dtype=np.float64),
++        # [DIAG v2] paiements NON imputables à une défausse (baton
++        # riichi perdu, honba) : comptés à part, PAS des deal-ins
++        'stick_lost': np.array([r.get('stick_lost', False) for r in rows],
++                               dtype=bool),
++        'stick_pts': np.array([r.get('stick_points', 0.0) for r in rows],
++                              dtype=np.float64),
+         'chunk': np.array([r['chunk'] for r in rows], dtype=np.int64),
+         'env': np.array([r['env_idx'] for r in rows], dtype=np.int64),
+         'round': np.array([r['round'] for r in rows], dtype=np.int64),
+@@ -254,9 +268,27 @@
+     n_dd = int(dd.sum())
+     rep = {'n_decisions': N, 'n_dealins': n_dd}
+ 
+-    # --- intégrité : dealt_in ⟺ danger[action] > 0 ------------------- #
+-    mism = int((dat['lbl_dd'] != dd).sum())
+-    rep['integrity_mismatch'] = mism
++    # --- intégrité [v2] --------------------------------------------- #
++    # Deux familles d'écarts de sémantique OPPOSÉE :
++    #  * ghost  = dealt_in SANS label : impossible avec le marquage v2
++    #    (les batons riichi -> stick_lost) ; 0 attendu ;
++    #  * yakuless = label SANS deal-in : l'adversaire tenpai non-furiten
++    #    attendait la tuile mais sa main n'a pas de yaku -> pas de ron.
++    #    Ces lbl ne sont PAS payables : le dng% des sweeps (lbl-based)
++    #    surestime le risque réellement payé.
++    paid = dd & dat['lbl_dd']
++    ghost = dd & ~dat['lbl_dd']
++    yakuless = dat['lbl_dd'] & ~dd
++    n_paid = int(paid.sum())
++    rep['n_dealins_paid'] = n_paid
++    rep['integrity'] = {
++        'dealt_in_sans_label': int(ghost.sum()),
++        'label_sans_deal_in_yakuless': int(yakuless.sum()),
++        'n_sticks': int(dat['stick_lost'].sum()),
++        'stick_points': float(
++            dat['stick_pts'][dat['stick_lost']].sum()),
++    }
++    rep['integrity_mismatch'] = int((dat['lbl_dd'] != dd).sum())
+ 
+     # --- tête danger EN LIVE sur la trajectoire d'éval ---------------- #
+     live = {'auc': float(auc_rank(D[M], dat['P'][M])),
+@@ -273,24 +305,25 @@
+     q = lambda v, ps: ([float(np.percentile(v, p_)) for p_ in ps]
+                        if len(v) else [float('nan')] * len(ps))
+     rep['p_played'] = {'all': q(dat['p_ch'], (10, 50, 90, 99))}
+-    if n_dd:
+-        rep['p_played']['dealins'] = q(dat['p_ch'][dd], (10, 25, 50, 75, 90))
+-
+-    # --- c_hat : coût des deal-ins (unités reward = score/1000) ------- #
+-    if n_dd:
+-        pts = dat['points'][dd]
+-        rep['c_hat'] = {'n': int(n_dd), 'mean': float(pts.mean()),
++    if n_paid:
++        rep['p_played']['dealins'] = q(dat['p_ch'][paid],
++                                       (10, 25, 50, 75, 90))
++
++    # --- c_hat : coût des deal-ins PAYÉS (unités reward=score/1000) -- #
++    if n_paid:
++        pts = dat['points'][paid]
++        rep['c_hat'] = {'n': int(n_paid), 'mean': float(pts.mean()),
+                         'median': float(np.median(pts)),
+                         'q10': float(np.percentile(pts, 10)),
+                         'q90': float(np.percentile(pts, 90)),
+                         'total': float(pts.sum())}
+ 
+-    # --- décomposition (A)/(B)/(C) des deal-ins ----------------------- #
+-    if n_dd:
+-        blind = dd & (dat['p_ch'] < p_blind)
+-        visible = dd & (dat['p_ch'] >= p_blind)
++    # --- décomposition (A)/(B)/(C) des deal-ins PAYÉS ----------------- #
++    if n_paid:
++        blind = paid & (dat['p_ch'] < p_blind)
++        visible = paid & (dat['p_ch'] >= p_blind)
+         w_pts = dat['points']          # 0 hors deal-ins -> pondération OK
+-        dec = {'p_blind': p_blind,
++        dec = {'p_blind': p_blind, 'n_paid': n_paid,
+                'A_head_blind': int(blind.sum()),
+                'visible': int(visible.sum())}
+         for tau in taus:
+@@ -322,14 +355,20 @@
+     for tau in taus:
+         for lam in lams:
+             a_cf, swap, save, create = counterfactual_blend(dat, tau, lam)
++            save_paid = swap & paid & ~D[idx, a_cf]
+             cf[f'tau={tau:g},lam={lam:g}'] = {
+                 'n_swaps': int(swap.sum()),
+                 'swap_pct': float(swap.mean()),
+                 'dealins_evites': int(save.sum()),
++                # [v2] 'payés évités' + économie réelle : les lbl évités
++                # incluent une part yakuless non payable ; seuls les
++                # deal-ins PAYÉS évités économisent des points
++                'dealins_payes_evites': int(save_paid.sum()),
++                'points_economises': float(
++                    -dat['points'][save_paid].sum()),
+                 'dealins_crees': int(create.sum()),
+                 'net': int(save.sum() - create.sum()),
+-                'dealins_residuels': int(
+-                    (dd & ~save).sum()),
++                'dealins_residuels': int((paid & ~save).sum()),
+             }
+     rep['counterfactual'] = cf
+     if out_json:
+@@ -340,13 +379,25 @@
+ 
+ def print_report(rep, taus, lams):
+     N, n_dd = rep['n_decisions'], rep['n_dealins']
++    n_paid = rep.get('n_dealins_paid', n_dd)
++    integ = rep.get('integrity', {})
+     print()
+-    print(f"[diag] {N} défausses agent | {n_dd} deal-ins "
+-          f"({100 * n_dd / max(N, 1):.2f}%)", flush=True)
+-    mism = rep['integrity_mismatch']
+-    print(f"[diag] intégrité dealt_in ⟺ danger[action]>0 : "
+-          f"{n_dd - mism}/{n_dd}"
+-          + (f" ({mism} ÉCARTS !)" if mism else " (0 écart)"), flush=True)
++    print(f"[diag] {N} défausses agent | {n_paid} deal-ins PAYÉS "
++          f"({100 * n_paid / max(N, 1):.2f}%)", flush=True)
++    n_gh = int(integ.get('dealt_in_sans_label', 0))
++    n_stick = max(n_gh, int(integ.get('n_sticks', 0)))
++    if n_stick:
++        print(f"[diag] paiements NON imputables à une défausse (baton "
++              f"riichi perdu / honba) : {n_stick} manches, "
++              f"{integ.get('stick_points', 0.0):.1f} pts -- comptés à "
++              f"part, PAS des deal-ins (bug du diag v1 : 11/72)",
++              flush=True)
++    print(f"[diag] intégrité : dealt_in sans label : {n_gh}"
++          + (" (ATTENDU 0 avec le marquage v2 !)" if n_gh
++             else " (ok)")
++          + " | label sans ron (yakuless, le label ignore le yaku) : "
++          f"{int(integ.get('label_sans_deal_in_yakuless', 0))}",
++          flush=True)
+     lv = rep['live_head']
+     print(f"[diag] tête EN LIVE sur la trajectoire : AUC {lv['auc']:.4f} "
+           f"| ECE {lv['ece']:.4f} | riichi {lv.get('auc_riichi', float('nan')):.4f}"
+@@ -357,7 +408,7 @@
+           f"q50={pa[1]:.4f} q90={pa[2]:.4f} q99={pa[3]:.4f}", flush=True)
+     if 'dealins' in rep['p_played']:
+         pd_ = rep['p_played']['dealins']
+-        print(f"[diag] p_cal de la tuile FATALE (deal-ins) : "
++        print(f"[diag] p_cal de la tuile FATALE (deal-ins PAYÉS) : "
+               f"q10={pd_[0]:.4f} q25={pd_[1]:.4f} q50={pd_[2]:.4f} "
+               f"q75={pd_[3]:.4f} q90={pd_[4]:.4f}", flush=True)
+     if 'c_hat' in rep:
+@@ -368,17 +419,21 @@
+               f"{c['total']:.1f}", flush=True)
+     if 'decomposition' in rep:
+         d = rep['decomposition']
+-        tot_pts = d['points_A'] + d['points_visible']
++        n_paid_d = d.get('n_paid', n_dd)
++        # [FIX v2] les points payés sont NÉGATIFS (pertes, unités
++        # reward) : l'ancien max(tot_pts, 1e-9) retournait TOUJOURS
++        # l'epsilon -> pourcentages -1.6e13 (diag v1, 96 donnes)
++        tot_pts = abs(d['points_A']) + abs(d['points_visible'])
+         print()
+-        print(f"-- décomposition des {n_dd} deal-ins "
++        print(f"-- décomposition des {n_paid_d} deal-ins PAYÉS "
+               f"(p_blind={d['p_blind']}) --", flush=True)
+         print(f"  (A) head-blind  : {d['A_head_blind']:4d} "
+-              f"({100 * d['A_head_blind'] / max(n_dd, 1):4.1f}%) | "
+-              f"{100 * d['points_A'] / max(tot_pts, 1e-9):4.1f}% des "
+-              f"points payés", flush=True)
++              f"({100 * d['A_head_blind'] / max(n_paid_d, 1):4.1f}%) | "
++              f"{100 * abs(d['points_A']) / max(tot_pts, 1e-9):4.1f}% "
++              f"des points payés", flush=True)
+         print(f"  visible (p≥{d['p_blind']}) : {d['visible']:4d} "
+-              f"({100 * d['visible'] / max(n_dd, 1):4.1f}%) | "
+-              f"{100 * d['points_visible'] / max(tot_pts, 1e-9):4.1f}% "
++              f"({100 * d['visible'] / max(n_paid_d, 1):4.1f}%) | "
++              f"{100 * abs(d['points_visible']) / max(tot_pts, 1e-9):4.1f}% "
+               f"des points", flush=True)
+         for tau in taus:
+             k = f'tau={tau:g}'
+@@ -397,12 +452,16 @@
+           "(1er ordre : les swaps ne re-dynamisent PAS la partie) --",
+           flush=True)
+     print(f"  {'tau':>4s} {'lam':>5s} {'swaps%':>7s} {'évités':>7s} "
+-          f"{'créés':>7s} {'net':>5s} {'dd résid':>8s}", flush=True)
++          f"{'payés':>6s} {'pts éco':>8s} {'créés':>7s} {'net':>5s} "
++          f"{'dd résid':>8s}", flush=True)
+     for tau in taus:
+         for lam in lams:
+             c = rep['counterfactual'][f'tau={tau:g},lam={lam:g}']
+             print(f"  {tau:4g} {lam:5g} {100 * c['swap_pct']:7.2f} "
+-                  f"{c['dealins_evites']:7d} {c['dealins_crees']:7d} "
++                  f"{c['dealins_evites']:7d} "
++                  f"{c.get('dealins_payes_evites', 0):6d} "
++                  f"{c.get('points_economises', 0.0):8.1f} "
++                  f"{c['dealins_crees']:7d} "
+                   f"{c['net']:+5d} {c['dealins_residuels']:8d}",
+                   flush=True)
+     print()
+@@ -412,6 +471,10 @@
+           "idée mais mal réglée (voir le contre-factuel pour le (τ, λ) "
+           "sélectif), et le RL doit apprendre la sélectivité.",
+           flush=True)
++    print("v2 : 'évités' compte les lbl (dont une part yakuless NON "
++          "payable) ; 'payés' = deal-ins réellement payés évités, "
++          "'pts éco' = économie réelle en unités reward (score/1000).",
++          flush=True)
+ 
+ 
+ def check_sweep(per_game, results_path):
+@@ -528,6 +591,8 @@
+         action=dat['A'].astype(np.int16),
+         riichi=dat['riichi'], dealt_in=dat['dealt_in'],
+         points=dat['points'].astype(np.float32),
++        stick_lost=dat['stick_lost'],
++        stick_pts=dat['stick_pts'].astype(np.float32),
+         chunk=dat['chunk'], env=dat['env'], round=dat['round'])
+     summary_path = os.path.join(args.out, 'diag_summary.json')
+     rep = analyze(dat, taus, lams, args.p_blind, out_json=summary_path)
+--- a/mahjong_ai/rl/eval_danger_blend.py
++++ b/mahjong_ai/rl/eval_danger_blend.py
+@@ -239,11 +239,21 @@
+                      dtype=np.float64)
+     n_rd = sum(int(s['n_rl_discards']) for s in per_game.values())
+     n_dd = sum(int(s['n_danger_discards']) for s in per_game.values())
++    # [v2d] deal-ins RÉELLEMENT payés (ron sur défausse dangereuse de
++    # l'agent) + points payés : le dng% lbl-based inclut une part
++    # yakuless NON payable (le label contrefactuel ignore le yaku) ;
++    # c'est la métrique économique de la porte
++    n_dpid = sum(int(s.get('n_dealins_paid', 0))
++                 for s in per_game.values())
++    pts_paid = sum(float(s.get('points_paid', 0.0))
++                   for s in per_game.values())
+     se = (float(ranks.std(ddof=1) / np.sqrt(len(ranks)))
+           if len(ranks) > 1 else 0.0)
+     return {'mr': float(ranks.mean()), 'mr_ic95': 1.96 * se,
+             'wr': float((ranks == 1).mean()), 'n_rd': n_rd, 'n_dd': n_dd,
+-            'dng_pct': 100.0 * n_dd / max(n_rd, 1)}
++            'dng_pct': 100.0 * n_dd / max(n_rd, 1),
++            'n_dpid': n_dpid, 'paid_pct': 100.0 * n_dpid / max(n_rd, 1),
++            'pts_paid': float(pts_paid)}
+ 
+ 
+ def paired_compare(base, arm, n_boot=2000, seed=777):
+@@ -259,6 +269,11 @@
+     da = np.array([arm[k]['n_danger_discards'] for k in keys], float)
+     nb = np.array([base[k]['n_rl_discards'] for k in keys], float)
+     na = np.array([arm[k]['n_rl_discards'] for k in keys], float)
++    # [v2d] deal-ins payés + points payés (appariés)
++    pb = np.array([base[k].get('n_dealins_paid', 0) for k in keys], float)
++    pa = np.array([arm[k].get('n_dealins_paid', 0) for k in keys], float)
++    xb = np.array([base[k].get('points_paid', 0.0) for k in keys], float)
++    xa = np.array([arm[k].get('points_paid', 0.0) for k in keys], float)
+     dng_b = float(db.sum() / max(nb.sum(), 1.0))
+     dng_a = float(da.sum() / max(na.sum(), 1.0))
+     rel = (dng_b - dng_a) / max(dng_b, 1e-9)
+@@ -283,12 +298,21 @@
+         rel_ic = (float('nan'), float('nan'))
+     q = lambda v: (float(np.percentile(v, 2.5)),
+                    float(np.percentile(v, 97.5)))
++    # économie de points payés (positif = le bras paie moins) ;
++    # points NÉGATIFS (pertes) -> économie = pertes_base - pertes_arm
++    # = (-xa) - (-xb) = xa - xb
++    saved_b = (xa[idx].sum(axis=1) - xb[idx].sum(axis=1))
+     return {'n_pairs': n,
+             'dmr': float((ra - rb).mean()), 'dmr_ic95': q(dmr_b),
+             'dng_base': dng_b, 'dng_arm': dng_a,
+             'd_dng_pts': 100.0 * (dng_a - dng_b),
+             'd_dng_pts_ic95': q(dpts_b),
+-            'rel_dng': float(rel), 'rel_dng_ic95': rel_ic}
++            'rel_dng': float(rel), 'rel_dng_ic95': rel_ic,
++            'paid_base': int(pb.sum()), 'paid_arm': int(pa.sum()),
++            'd_paid': int(pa.sum() - pb.sum()),
++            'pts_base': float(xb.sum()), 'pts_arm': float(xa.sum()),
++            'pts_saved': float(xa.sum() - xb.sum()),
++            'pts_saved_ic95': q(saved_b)}
+ 
+ 
+ def main():
+@@ -391,8 +415,9 @@
+                 base_games = per_game
+                 print(f"[sweep] == baseline : mr={s['mr']:.3f} "
+                       f"(±{s['mr_ic95']:.3f}) wr={s['wr']:.3f} | "
+-                      f"dng {s['dng_pct']:.2f}% ({s['n_dd']}/{s['n_rd']})",
+-                      flush=True)
++                      f"dng {s['dng_pct']:.2f}% ({s['n_dd']}/{s['n_rd']}) "
++                      f"| PAYÉS {s['n_dpid']} ({s['paid_pct']:.2f}%, "
++                      f"{s['pts_paid']:.0f} pts)", flush=True)
+                 dev = s['mr'] - REF_MR
+                 print(f"[sweep] contrôle non-régression : mr - {REF_MR} = "
+                       f"{dev:+.3f} (attendu +0.000 si mêmes réglages que "
+@@ -419,12 +444,17 @@
+                 rel_ci = (f"[{100 * rel_lo:+.1f}..{100 * rel_hi:+.1f}]"
+                           if rel_lo == rel_lo else "[NA : trop peu de dng]")
+                 pts_lo, pts_hi = pc['d_dng_pts_ic95']
++                sv_lo, sv_hi = pc['pts_saved_ic95']
+                 print(f"[sweep]    vs baseline : Δmr={pc['dmr']:+.3f} "
+                       f"[IC95 {pc['dmr_ic95'][0]:+.3f}.."
+                       f"{pc['dmr_ic95'][1]:+.3f}] | réduction dng "
+                       f"{100 * pc['rel_dng']:+.1f}% {rel_ci} "
+                       f"(Δ {pc['d_dng_pts']:+.2f} pt, moins = mieux, "
+                       f"[{pts_lo:+.2f}..{pts_hi:+.2f}]) | "
++                      f"payés {pc['paid_base']}→{pc['paid_arm']} "
++                      f"(Δ {pc['d_paid']:+d}), économie "
++                      f"{pc['pts_saved']:+.0f} pts "
++                      f"[{sv_lo:+.0f}..{sv_hi:+.0f}] | "
+                       f"PORTE : {'PASSÉE' if gate_ok else 'échouée'}",
+                       flush=True)
+             results['arms'][label] = {
+@@ -432,7 +462,9 @@
+             results['arms'][label]['per_game'] = {
+                 f'{c}.{e}': {'rank': g['rank_of_seat0'],
+                              'rd': int(g['n_rl_discards']),
+-                             'dd': int(g['n_danger_discards'])}
++                             'dd': int(g['n_danger_discards']),
++                             'dpid': int(g.get('n_dealins_paid', 0)),
++                             'pts': float(g.get('points_paid', 0.0))}
+                 for (c, e), g in per_game.items()}
+             with open(results_path, 'w', encoding='utf-8') as f:
+                 json.dump(results, f, indent=2, ensure_ascii=False)

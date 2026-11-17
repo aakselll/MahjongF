@@ -1,0 +1,394 @@
+# [DIAG v4] Reconciliation payes : fix GRP + arbitrage vrai deal-in vs fantome
+# Etat de depart suppose : rl v3 (diag_dealins_v3) + multi_agent SANS la cle
+# is_chankan + game_env courant.
+# Application depuis la racine du repo : patch -p1 < diag_v4.patch
+# (ou copier directement les fichiers du dossier mahjong_ai/ du paquet)
+
+--- a/mahjong_ai/rl/rollout.py
++++ b/mahjong_ai/rl/rollout.py
+@@ -68,7 +68,8 @@
+                  'pending_reward', 'round_idx_per_seat', 'round_counter',
+                  'grp_delta_sum', 'max_honba', 'stats',
+                  'env_stats_before', 'diag_all', 'diag_rounds',
+-                 'diag_round_rows', 'last_discard_danger')
++                 'diag_round_rows', 'last_discard_danger',
++                 'agent_round_seat')
+ 
+     def __init__(self, env, agent_seat, idx=0):
+         self.env = env
+@@ -91,6 +92,12 @@
+         # était-elle dangereuse (label contrefactuel) ? Base du marquage
+         # dealt_in et des compteurs "deal-ins payés" (voir _after_step).
+         self.last_discard_danger = False
++        # [DIAG v4] siège de l'agent DANS le round_env (les sièges du
++        # round_env sont tournés : game_seat = (dealer + round_seat)%4,
++        # cf. _seat_mapping). Capturé au DÉBUT de chaque manche car
++        # dealer_seat est déjà celui de la manche SUIVANTE quand
++        # _after_step lit les internes du round_env terminé.
++        self.agent_round_seat = None
+ 
+     def new_game(self, agent_seat):
+         self.agent_seat = agent_seat
+@@ -105,6 +112,7 @@
+         self.diag_rounds = []
+         self.diag_round_rows = []
+         self.last_discard_danger = False
++        self.agent_round_seat = None
+         self.stats = {
+             'env_idx': self.idx,          # [ÉTAPE 3] clé d'appariement
+             'n_rounds': 0, 'n_tsumo': 0, 'n_ron': 0, 'n_exhaustive': 0,
+@@ -117,9 +125,19 @@
+             'n_ron_paid_nodanger': 0,
+             # [DIAG v3] chankans payés (ron adverse sur MON shouminkan)
+             'n_chankan_paid': 0, 'points_chankan': 0.0,
++            # [DIAG v4] arbitrage vrai deal-in (tuile gagnante venue de
++            # l'agent, lue dans le round_env) vs fantôme (paiement
++            # imputé à tort par la convention ldd : bâton riichi,
++            # honba) -- cf. _after_step
++            'n_dealins_true': 0, 'points_true': 0.0,
++            'n_dealins_ghost': 0, 'points_ghost': 0.0,
++            'n_wfa_noldd': 0,
+         }
+         self.env_stats_before = self.env.get_stats()
+         self.req = self.env.reset_round()
++        # [DIAG v4] siège round_env de l'agent pour CETTE manche
++        self.agent_round_seat = ((agent_seat - self.env.dealer_seat) % 4
++                                 if agent_seat is not None else None)
+ 
+ 
+ def finalize_returns(transitions, rho=0.85):
+@@ -454,7 +472,21 @@
+         # mains réelles -2.8/-4.9/-6.8, cf. clé is_chankan [DIAG v3] ;
+         # 19 des 80 lbl n'ont jamais été ronnés -- mains yakuless, le
+         # label ignore le yaku par construction, cf. _danger_labels.)
+-        pay = (float(round_rewards.get(slot.agent_seat, 0.0))
++        # [DIAG v4] compteurs économiques sur les récompenses BRUTES.
++        # ATTENTION : final_rewards est FAÇONNÉ par le GRP quand un
++        # prédicteur est chargé (game_env._final : grp_rewards =
++        # phi_k - phi_{k-1}), ce ne sont PAS des paiements. Le sweep v2d
++        # (--grp chargé) a ainsi compté des deltas GRP (55 payés /
++        # -328.4 pts) pendant que le diag v3 (grp_path=None -> brutes)
++        # comptait les paiements réels (61 / -254.8) sur les MÊMES
++        # donnes : canary rd/dd identiques mais dpid/pts incohérents.
++        # La clé additive raw_round_rewards (game_env v4) rend les
++        # compteurs corrects dans tous les cas ; repli final_rewards =
++        # env sans la clé (déjà brut sans prédicteur).
++        raw_rewards = result.get('raw_round_rewards')
++        if raw_rewards is None:
++            raw_rewards = round_rewards
++        pay = (float(raw_rewards.get(slot.agent_seat, 0.0))
+                if slot.agent_seat is not None else 0.0)
+         ronish = outcome in ('ron', 'multi_ron')
+         # [DIAG v3] chankan : ron adverse sur le SHOUMINKAN de l'agent
+@@ -463,16 +495,42 @@
+         # dernière défausse -- d'où les fantômes v1 "dealt_in sans
+         # label"), NI un baton riichi : compté à part.
+         ckan = bool(result.get('is_chankan', False))
++        # [DIAG v4] arbitrage lu dans le round_env au moment où la
++        # manche se termine :
++        #  * win_from_agent : la dernière tuile jetée (défausse OU kakan
++        #    -- _last_discarder est posé sur les deux chemins, cf.
++        #    multi_agent) vient du siège de l'agent. Sur une issue ron,
++        #    la tuile gagnante est donc la sienne -> VRAI deal-in ;
++        #  * agent_riichi : l'agent avait déclaré riichi dans la manche
++        #    -> un paiement hors win_from_agent est alors son bâton
++        #    (-1.0) perdu sur le ron d'un autre.
++        re_ = slot.env.round_env
++        ars = slot.agent_round_seat
++        wfa = bool(ars is not None
++                   and getattr(re_, '_last_discarder', None) == ars)
++        _rii = getattr(re_, 'riichi', None)
++        ari = bool(ars is not None and _rii and _rii[ars])
+         paid_ron = (ronish or outcome == 'chankan') and pay < 0.0
+         if paid_ron:
+             if ckan:
+                 slot.stats['n_chankan_paid'] += 1
+                 slot.stats['points_chankan'] += float(pay)
+-            elif slot.last_discard_danger:
+-                slot.stats['n_dealins_paid'] += 1
+-                slot.stats['points_paid'] += float(pay)
+             else:
+-                slot.stats['n_ron_paid_nodanger'] += 1
++                # [DIAG v4] vérité terrain (convention ldd conservée à
++                # part pour la comparabilité v2/v3)
++                if wfa:
++                    slot.stats['n_dealins_true'] += 1
++                    slot.stats['points_true'] += float(pay)
++                    if not slot.last_discard_danger:
++                        slot.stats['n_wfa_noldd'] += 1
++                else:
++                    slot.stats['n_dealins_ghost'] += 1
++                    slot.stats['points_ghost'] += float(pay)
++                if slot.last_discard_danger:
++                    slot.stats['n_dealins_paid'] += 1
++                    slot.stats['points_paid'] += float(pay)
++                else:
++                    slot.stats['n_ron_paid_nodanger'] += 1
+         if self.diag_active and slot.diag_round_rows:
+             if ronish and pay < 0.0:
+                 if ckan:
+@@ -486,9 +544,15 @@
+                     # : paiement réel mais PAS un deal-in de défausse
+                     slot.diag_round_rows[-1]['stick_lost'] = True
+                     slot.diag_round_rows[-1]['stick_points'] = pay
++                # [DIAG v4] champs d'arbitrage sur la ligne marquée
++                slot.diag_round_rows[-1]['win_from_agent'] = wfa
++                slot.diag_round_rows[-1]['agent_riichi'] = ari
+             slot.diag_rounds.append(
+                 {'round': slot.round_counter, 'outcome': outcome,
+-                 'agent_pay': pay, 'n_rows': len(slot.diag_round_rows)})
++                 'agent_pay': pay, 'n_rows': len(slot.diag_round_rows),
++                 # [DIAG v4] arbitrage par manche (summary)
++                 'win_from_agent': (wfa if ronish else None),
++                 'agent_riichi': ari})
+             slot.diag_all.extend(slot.diag_round_rows)
+             slot.diag_round_rows = []
+         slot.last_discard_danger = False
+@@ -523,6 +587,12 @@
+         else:
+             # manche terminée mais partie en cours -> manche suivante
+             slot.req = slot.env.reset_round()
++            # [DIAG v4] siège round_env de l'agent pour la manche
++            # suivante (cf. commentaire _Slot.__init__)
++            slot.agent_round_seat = ((slot.agent_seat
++                                      - slot.env.dealer_seat) % 4
++                                     if slot.agent_seat is not None
++                                     else None)
+ 
+     @staticmethod
+     def _last_transition_of(slot, seat):
+
+--- a/mahjong_ai/rl/diag_dealins.py
++++ b/mahjong_ai/rl/diag_dealins.py
+@@ -246,6 +246,17 @@
+                                  dtype=bool),
+         'chankan_pts': np.array([r.get('chankan_points', 0.0) for r in rows],
+                                 dtype=np.float64),
++        # [DIAG v4] arbitrage : la tuile gagnante venait-elle du siège
++        # de l'agent (VRAI deal-in : _last_discarder du round_env ==
++        # agent) ? l'agent était-il riichi dans la manche (paiement
++        # -1.0 hors win_from_agent = bâton perdu sur le ron d'un
++        # autre) ?
++        'win_from_agent': np.array(
++            [bool(r.get('win_from_agent', False)) for r in rows],
++            dtype=bool),
++        'agent_riichi': np.array(
++            [bool(r.get('agent_riichi', False)) for r in rows],
++            dtype=bool),
+         'chunk': np.array([r['chunk'] for r in rows], dtype=np.int64),
+         'env': np.array([r['env_idx'] for r in rows], dtype=np.int64),
+         'round': np.array([r['round'] for r in rows], dtype=np.int64),
+@@ -305,6 +316,67 @@
+         else 0.0,
+     }
+     rep['integrity_mismatch'] = int((dat['lbl_dd'] != dd).sum())
++
++    # --- [DIAG v4] arbitrage VRAI deal-in vs FANTÔME ------------------ #
++    # Le marquage v2/v3 (ldd = dernière défausse lbl) attrape des
++    # fantômes : agent riichi dont la dernière défausse était lbl par
++    # hasard quand un autre siège défausse la tuile gagnante -> le
++    # paiement de l'agent est son BÂTON, pas un deal-in. win_from_agent
++    # (lu dans le round_env à la fin de manche) tranche : la tuile
++    # gagnante est-elle venue de l'agent ?
++    wfa = dat.get('win_from_agent', np.zeros(N, bool))
++    ari = dat.get('agent_riichi', np.zeros(N, bool))
++    true_dd = paid & wfa
++    ghost_dd = paid & ~wfa
++    stick = dat['stick_lost']
++    # sticks à -1.0 = vrais bâtons ; |stick_pts| > 1.05 = paiements
++    # d'une autre nature (chankans non séparés si la clé is_chankan
++    # de l'env manque, honba, pao...) : à arbitrer au cas par cas
++    big_stick = stick & (dat['stick_pts'] < -1.05)
++    rep['v4_arbitration'] = {
++        'n_paid_true': int(true_dd.sum()),
++        'pts_paid_true': float(dat['points'][true_dd].sum()),
++        'n_paid_ghost': int(ghost_dd.sum()),
++        'pts_paid_ghost': float(dat['points'][ghost_dd].sum()),
++        'n_ghost_riichi': int((ghost_dd & ari).sum()),
++        'n_ghost_noriichi': int((ghost_dd & ~ari).sum()),
++        'n_stick_baton': int((stick & ~big_stick).sum()),
++        'n_stick_big': int(big_stick.sum()),
++        'pts_stick_big': float(dat['stick_pts'][big_stick].sum()),
++        'n_wfa_noldd': int((wfa & paid & ~dat['lbl_dd']).sum()),
++    }
++    # table des événements payés (pour la réponse humaine)
++    TILE34 = ([f'{n}m' for n in range(1, 10)]
++              + [f'{n}p' for n in range(1, 10)]
++              + [f'{n}s' for n in range(1, 10)]
++              + ['E', 'S', 'W', 'N', 'haku', 'hatsu', 'chun'])
++    ev = []
++    for i in np.nonzero(paid | stick | ckan)[0]:
++        if ckan[i]:
++            nature = 'CHANKAN (tuile du kan, pas la défausse)'
++            pts = float(dat['chankan_pts'][i])
++        elif stick[i]:
++            nature = ('bâton probable' if not big_stick[i]
++                      else 'STICK BIG (pas un bâton : arbitrer)')
++            pts = float(dat['stick_pts'][i])
++        elif wfa[i]:
++            nature = 'VRAI deal-in (tuile gagnante = ma défausse)'
++            pts = float(dat['points'][i])
++        else:
++            if ari[i]:
++                nature = ("FANTÔME bâton (tuile gagnante d'un autre "
++                          "siège, agent riichi)")
++            else:
++                nature = ("FANTÔME SANS riichi (tuile gagnante d'un "
++                          "autre siège, agent non riichi : arbitrer)")
++            pts = float(dat['points'][i])
++        ev.append({'chunk': int(dat['chunk'][i]), 'env': int(dat['env'][i]),
++                   'round': int(dat['round'][i]),
++                   'tile': TILE34[int(dat['A'][i])],
++                   'p': float(dat['p_ch'][i]), 'points': pts,
++                   'win_from_agent': bool(wfa[i]),
++                   'agent_riichi': bool(ari[i]), 'nature': nature})
++    rep['v4_events'] = ev
+ 
+     # --- tête danger EN LIVE sur la trajectoire d'éval ---------------- #
+     live = {'auc': float(auc_rank(D[M], dat['P'][M])),
+@@ -413,6 +485,26 @@
+         print(f"[diag] paiements NON imputables restants (baton riichi "
+               f"perdu / honba) : {n_stick} manches, "
+               f"{integ.get('stick_points', 0.0):.1f} pts", flush=True)
++    # [DIAG v4] verdict de l'arbitrage vrai deal-in vs fantôme
++    v4 = rep.get('v4_arbitration')
++    if v4:
++        print(f"[diag v4] ARBITRAGE (tuile gagnante venue de l'agent ?) : "
++              f"{v4['n_paid_true']} VRAIS deal-ins "
++              f"({v4['pts_paid_true']:.1f} pts) vs "
++              f"{v4['n_paid_ghost']} FANTÔMES "
++              f"({v4['pts_paid_ghost']:.1f} pts, dont "
++              f"{v4['n_ghost_riichi']} avec agent riichi = bâton) | "
++              f"sticks : {v4['n_stick_baton']} bâtons -1.0 + "
++              f"{v4['n_stick_big']} BIG "
++              f"({v4['pts_stick_big']:.1f} pts, chankans si la clé "
++              f"is_chankan manquait) | wfa sans lbl : "
++              f"{v4['n_wfa_noldd']}", flush=True)
++        for e in rep.get('v4_events', []):
++            print(f"[diag v4]   {e['chunk']}:{e['env']} r{e['round']:02d} "
++                  f"{e['tile']:5s} p={e['p']:.4f} {e['points']:+.1f} pts "
++                  f"wfa={int(e['win_from_agent'])} "
++                  f"riichi={int(e['agent_riichi'])} -> {e['nature']}",
++                  flush=True)
+     print(f"[diag] intégrité : dealt_in sans label : {n_gh}"
+           + (" (ATTENDU 0 avec le marquage v2 !)" if n_gh
+              else " (ok)")
+@@ -616,6 +708,8 @@
+         stick_pts=dat['stick_pts'].astype(np.float32),
+         chankan_paid=dat['chankan_paid'],
+         chankan_pts=dat['chankan_pts'].astype(np.float32),
++        win_from_agent=dat['win_from_agent'],
++        agent_riichi=dat['agent_riichi'],
+         chunk=dat['chunk'], env=dat['env'], round=dat['round'])
+     summary_path = os.path.join(args.out, 'diag_summary.json')
+     rep = analyze(dat, taus, lams, args.p_blind, out_json=summary_path)
+
+--- a/mahjong_ai/rl/eval_danger_blend.py
++++ b/mahjong_ai/rl/eval_danger_blend.py
+@@ -253,6 +253,16 @@
+     n_ckan = sum(int(s.get('n_chankan_paid', 0)) for s in per_game.values())
+     pts_ckan = sum(float(s.get('points_chankan', 0.0))
+                    for s in per_game.values())
++    # [v4] arbitrage : deal-ins VRAIS (tuile gagnante venue de l'agent,
++    # lue dans le round_env) vs FANTÔMES (bâton/honba imputés à tort par
++    # la convention ldd). LA métrique de la porte v2e doit être celle-
++    # ci (ou au minimum être décidée avec ces chiffres sous les yeux).
++    n_true = sum(int(s.get('n_dealins_true', 0)) for s in per_game.values())
++    pts_true = sum(float(s.get('points_true', 0.0))
++                   for s in per_game.values())
++    n_gho = sum(int(s.get('n_dealins_ghost', 0)) for s in per_game.values())
++    pts_gho = sum(float(s.get('points_ghost', 0.0))
++                  for s in per_game.values())
+     se = (float(ranks.std(ddof=1) / np.sqrt(len(ranks)))
+           if len(ranks) > 1 else 0.0)
+     return {'mr': float(ranks.mean()), 'mr_ic95': 1.96 * se,
+@@ -260,7 +270,9 @@
+             'dng_pct': 100.0 * n_dd / max(n_rd, 1),
+             'n_dpid': n_dpid, 'paid_pct': 100.0 * n_dpid / max(n_rd, 1),
+             'pts_paid': float(pts_paid),
+-            'n_ckan': n_ckan, 'pts_ckan': float(pts_ckan)}
++            'n_ckan': n_ckan, 'pts_ckan': float(pts_ckan),
++            'n_true': n_true, 'pts_true': float(pts_true),
++            'n_ghost': n_gho, 'pts_ghost': float(pts_gho)}
+ 
+ 
+ def paired_compare(base, arm, n_boot=2000, seed=777):
+@@ -425,8 +437,11 @@
+                       f"dng {s['dng_pct']:.2f}% ({s['n_dd']}/{s['n_rd']}) "
+                       f"| PAYÉS {s['n_dpid']} ({s['paid_pct']:.2f}%, "
+                       f"{s['pts_paid']:.0f} pts) | chankans "
+-                      f"{s['n_ckan']} ({s['pts_ckan']:.0f} pts)",
+-                      flush=True)
++                      f"{s['n_ckan']} ({s['pts_ckan']:.0f} pts) | "
++                      f"[v4] VRAIS {s.get('n_true', 0)} "
++                      f"({s.get('pts_true', 0.0):.0f} pts) vs FANTÔMES "
++                      f"{s.get('n_ghost', 0)} "
++                      f"({s.get('pts_ghost', 0.0):.0f} pts)", flush=True)
+                 dev = s['mr'] - REF_MR
+                 print(f"[sweep] contrôle non-régression : mr - {REF_MR} = "
+                       f"{dev:+.3f} (attendu +0.000 si mêmes réglages que "
+@@ -475,7 +490,11 @@
+                              'dpid': int(g.get('n_dealins_paid', 0)),
+                              'pts': float(g.get('points_paid', 0.0)),
+                              'ckan': int(g.get('n_chankan_paid', 0)),
+-                             'ckpts': float(g.get('points_chankan', 0.0))}
++                             'ckpts': float(g.get('points_chankan', 0.0)),
++                             'true': int(g.get('n_dealins_true', 0)),
++                             'tpts': float(g.get('points_true', 0.0)),
++                             'gho': int(g.get('n_dealins_ghost', 0)),
++                             'gpts': float(g.get('points_ghost', 0.0))}
+                 for (c, e), g in per_game.items()}
+             with open(results_path, 'w', encoding='utf-8') as f:
+                 json.dump(results, f, indent=2, ensure_ascii=False)
+
+--- a/mahjong_ai/envs/multi_agent.py
++++ b/mahjong_ai/envs/multi_agent.py
+@@ -1091,8 +1091,25 @@
+                                             for s in range(4):
+                                                 final_rewards[s] += payment[s]
+                                         outcome = "multi_ron" if len(chankan_ronners) > 1 else "ron"
+-                                        return self._final(prev_pending[0], prev_pending[1],
+-                                                           final_rewards, outcome)
++                                        # [DIAG v3] clé ADDITIVE : ce ron est
++                                        # un CHANKAN (sur le shouminkan de
++                                        # `seat`). Le runner distingue ce
++                                        # paiement (imputable au KAN, pas à
++                                        # une défausse) du deal-in de défausse
++                                        # et du baton riichi : le diag v1
++                                        # comptait les chankans comme deal-ins
++                                        # de la dernière défausse (11 des 72
++                                        # "deal-ins" sur 96 donnes v2b --
++                                        # points -2.8/-4.9/-6.8 = mains
++                                        # réelles, pas des batons -1.0).
++                                        # Dynamique inchangée : la clé
++                                        # n'est lue par personne dans l'env.
++                                        res = self._final(prev_pending[0],
++                                                          prev_pending[1],
++                                                          final_rewards,
++                                                          outcome)
++                                        res['is_chankan'] = True
++                                        return res
+ 
+                             abort = self._check_abortive_draw()
+ 
+
+--- a/mahjong_ai/training/game_env.py
++++ b/mahjong_ai/training/game_env.py
+@@ -334,6 +334,16 @@
+ 
+         translated = dict(result)
+         translated["final_rewards"] = grp_rewards
++        # [DIAG v4] récompenses BRUTES de manche (paiements réels /1000,
++        # bâtons compris), clé ADDITIVE. Les compteurs économiques du
++        # runner (deal-ins payés, points payés) doivent lire CECI et non
++        # final_rewards, qui est façonné par le GRP quand un prédicteur
++        # est chargé (grp_rewards = phi_k - phi_{k-1}) -- bug du sweep
++        # v2d : dpid/pts mesuraient des deltas GRP, pas des paiements
++        # (55 payés/-328.4 pts vs 61/-254.8 du diag sans GRP sur les
++        # mêmes donnes, canary rd/dd identiques). Personne ne lit cette
++        # clé dans l'env : dynamique inchangée.
++        translated["raw_round_rewards"] = real_round_rewards
+         translated["acting_seat"] = None
+         translated["game_done"] = game_done
+         translated["end_reason"] = end_reason
+

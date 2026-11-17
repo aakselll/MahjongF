@@ -67,7 +67,8 @@ class _Slot:
     __slots__ = ('env', 'idx', 'req', 'agent_seat', 'transitions',
                  'pending_reward', 'round_idx_per_seat', 'round_counter',
                  'grp_delta_sum', 'max_honba', 'stats',
-                 'env_stats_before')
+                 'env_stats_before', 'diag_all', 'diag_rounds',
+                 'diag_round_rows', 'last_discard_danger')
 
     def __init__(self, env, agent_seat, idx=0):
         self.env = env
@@ -82,6 +83,14 @@ class _Slot:
         self.max_honba = 0
         self.stats = None
         self.env_stats_before = None
+        # [DIAG DEAL-INS] tampons d'instrumentation (inertes sans diag)
+        self.diag_all = []
+        self.diag_rounds = []
+        self.diag_round_rows = []
+        # [DIAG v2] la DERNIÈRE défausse RL de la manche courante
+        # était-elle dangereuse (label contrefactuel) ? Base du marquage
+        # dealt_in et des compteurs "deal-ins payés" (voir _after_step).
+        self.last_discard_danger = False
 
     def new_game(self, agent_seat):
         self.agent_seat = agent_seat
@@ -92,11 +101,22 @@ class _Slot:
         self.round_counter = 0
         self.grp_delta_sum = {s: 0.0 for s in range(4)}
         self.max_honba = 0
+        self.diag_all = []
+        self.diag_rounds = []
+        self.diag_round_rows = []
+        self.last_discard_danger = False
         self.stats = {
             'env_idx': self.idx,          # [ÉTAPE 3] clé d'appariement
             'n_rounds': 0, 'n_tsumo': 0, 'n_ron': 0, 'n_exhaustive': 0,
             'n_abortive': 0, 'n_unhandled': 0, 'n_rl_discards': 0,
             'n_danger_discards': 0,
+            # [DIAG v2] deal-ins RÉELLEMENT payés (ron sur MA défausse
+            # dangereuse) vs paiements non imputables (baton riichi,
+            # honba, chankan) -- cf. _after_step
+            'n_dealins_paid': 0, 'points_paid': 0.0,
+            'n_ron_paid_nodanger': 0,
+            # [DIAG v3] chankans payés (ron adverse sur MON shouminkan)
+            'n_chankan_paid': 0, 'points_chankan': 0.0,
         }
         self.env_stats_before = self.env.get_stats()
         self.req = self.env.reset_round()
@@ -166,6 +186,12 @@ class VecRunner:
             env.round_env.compute_danger = danger_labels
             self.slots.append(_Slot(env, agent_seat=None, idx=i))
         self.seat_rng = np.random.RandomState((seed or 0) + 7777)
+        # [DIAG DEAL-INS] instrumentation PURE : active uniquement si
+        # l'agent expose pop_diag() (mahjong_ai.rl.diag_dealins) ; sinon
+        # aucun des hooks ci-dessous ne fait quoi que ce soit (aucun
+        # effet sur dynamiques/récompenses/trajectoires).
+        self.diag_active = callable(getattr(agent, 'pop_diag', None))
+        self.diag_games = []
         la_str = 'ON' if compute_lookahead else (
             "OFF (80 canaux lookahead mis a zero a l'execution : OK "
             "seulement si le SL de depart fut entraine SANS lookahead "
@@ -239,6 +265,17 @@ class VecRunner:
                 if result.get('game_done', False):
                     episodes.append(slot.transitions)
                     all_stats.append(self._finish_game(slot))
+                    # [DIAG DEAL-INS] récupération avant réutilisation
+                    # du slot par la partie suivante
+                    if self.diag_active:
+                        self.diag_games.append({
+                            'env_idx': slot.idx,
+                            'game': sum(1 for g in self.diag_games
+                                        if g['env_idx'] == slot.idx),
+                            'rows': slot.diag_all,
+                            'rounds': slot.diag_rounds})
+                        slot.diag_all = []
+                        slot.diag_rounds = []
                     finished.append(p)
             for p in reversed(finished):
                 slot = active.pop(p)
@@ -279,9 +316,15 @@ class VecRunner:
             g = gamma_t if gamma_override is None else gamma_override
             actions, logps, values, oo_masked = self.agent.act_rl(
                 obs_n, obs_o, masks, g, deterministic=deterministic)
+            # [DIAG DEAL-INS] l'agent (diag_dealins) rend une ligne par
+            # requête du batch (None si non armé) ; purement passif ici.
+            diag_rows = (self.agent.pop_diag()
+                         if self.diag_active else None)
             extras = []
             for i, r in enumerate(reqs):
                 extras.append({
+                    'diag': (diag_rows[i]
+                             if diag_rows is not None else None),
                     'obs_normal': np.asarray(r['obs'], dtype=np.float16),
                     'obs_oracle': oo_masked[i],
                     'obs_oracle_full': np.asarray(r['oracle'],
@@ -322,6 +365,22 @@ class VecRunner:
             slot.stats['n_rl_discards'] += 1
             if float(ex['danger'][action]) > 0:
                 slot.stats['n_danger_discards'] += 1
+            # [DIAG v2] mémorisé pour la fin de manche : le ron payé
+            # n'est un deal-in QUE si la dernière défausse était
+            # dangereuse (instrumentation pure, zéro dynamique)
+            slot.last_discard_danger = float(ex['danger'][action]) > 0
+            # [DIAG DEAL-INS] enrichit la ligne rendue par l'agent avec
+            # ce que seul le runner connaît (label danger contrefactuel
+            # 34 voies, masque, action) ; inert sans diag.
+            row = ex.get('diag')
+            if row is not None:
+                row['action'] = int(action)
+                row['danger'] = np.asarray(ex['danger'],
+                                            dtype=np.uint8)
+                row['mask'] = (np.asarray(ex['mask']) > 0)
+                row['round'] = slot.round_counter
+                row['env_idx'] = slot.idx
+                slot.diag_round_rows.append(row)
         if not collect:
             return
         seat = req['seat']
@@ -382,6 +441,57 @@ class VecRunner:
             else:
                 slot.pending_reward[s] += r_s
         slot.round_idx_per_seat = {s: [] for s in range(4)}
+
+        # [DIAG v2] fin de manche. pay < 0 sur une issue en ron n'est un
+        # DEAL-IN de l'agent QUE si sa dernière défausse de manche était
+        # dangereuse (danger[action] > 0 -- les requêtes RON adverses
+        # sont toujours acceptées -> ron réel ⟹ label positif). Sinon le
+        # paiement n'est PAS imputable à une défausse : baton riichi
+        # perdu (le -1000 est prélevé dans final_rewards pour TOUTE fin
+        # de manche, cf. _final de game_env), honba, ou chankan ->
+        # compté à part. (diag v1 sur 96 donnes : 11 des 72 "deal-ins"
+        # étaient des CHANKANS -- rons sur le shouminkan de l'agent,
+        # mains réelles -2.8/-4.9/-6.8, cf. clé is_chankan [DIAG v3] ;
+        # 19 des 80 lbl n'ont jamais été ronnés -- mains yakuless, le
+        # label ignore le yaku par construction, cf. _danger_labels.)
+        pay = (float(round_rewards.get(slot.agent_seat, 0.0))
+               if slot.agent_seat is not None else 0.0)
+        ronish = outcome in ('ron', 'multi_ron')
+        # [DIAG v3] chankan : ron adverse sur le SHOUMINKAN de l'agent
+        # (clé additive posée par l'env). Paiement réel mais NI un
+        # deal-in de défausse (la tuile fatale est celle du KAN, pas la
+        # dernière défausse -- d'où les fantômes v1 "dealt_in sans
+        # label"), NI un baton riichi : compté à part.
+        ckan = bool(result.get('is_chankan', False))
+        paid_ron = (ronish or outcome == 'chankan') and pay < 0.0
+        if paid_ron:
+            if ckan:
+                slot.stats['n_chankan_paid'] += 1
+                slot.stats['points_chankan'] += float(pay)
+            elif slot.last_discard_danger:
+                slot.stats['n_dealins_paid'] += 1
+                slot.stats['points_paid'] += float(pay)
+            else:
+                slot.stats['n_ron_paid_nodanger'] += 1
+        if self.diag_active and slot.diag_round_rows:
+            if ronish and pay < 0.0:
+                if ckan:
+                    slot.diag_round_rows[-1]['chankan_paid'] = True
+                    slot.diag_round_rows[-1]['chankan_points'] = pay
+                elif slot.last_discard_danger:
+                    slot.diag_round_rows[-1]['dealt_in'] = True
+                    slot.diag_round_rows[-1]['points_paid'] = pay
+                else:
+                    # baton riichi perdu sur le ron d'un autre (ou honba)
+                    # : paiement réel mais PAS un deal-in de défausse
+                    slot.diag_round_rows[-1]['stick_lost'] = True
+                    slot.diag_round_rows[-1]['stick_points'] = pay
+            slot.diag_rounds.append(
+                {'round': slot.round_counter, 'outcome': outcome,
+                 'agent_pay': pay, 'n_rows': len(slot.diag_round_rows)})
+            slot.diag_all.extend(slot.diag_round_rows)
+            slot.diag_round_rows = []
+        slot.last_discard_danger = False
 
         if result.get('game_done', False):
             # rewards pending -> dernière transition du siège

@@ -239,11 +239,28 @@ def arm_summary(per_game):
                      dtype=np.float64)
     n_rd = sum(int(s['n_rl_discards']) for s in per_game.values())
     n_dd = sum(int(s['n_danger_discards']) for s in per_game.values())
+    # [v2d] deal-ins RÉELLEMENT payés (ron sur défausse dangereuse de
+    # l'agent) + points payés : le dng% lbl-based inclut une part
+    # yakuless NON payable (le label contrefactuel ignore le yaku) ;
+    # c'est la métrique économique de la porte
+    n_dpid = sum(int(s.get('n_dealins_paid', 0))
+                 for s in per_game.values())
+    pts_paid = sum(float(s.get('points_paid', 0.0))
+                   for s in per_game.values())
+    # [v3] chankans payés (ron adverse sur le shouminkan de l'agent) :
+    # surveillance -- le blend ne touche pas les kans, mais le futur
+    # garde-fou kong (--danger-head sur KONG_YES) aura cette référence
+    n_ckan = sum(int(s.get('n_chankan_paid', 0)) for s in per_game.values())
+    pts_ckan = sum(float(s.get('points_chankan', 0.0))
+                   for s in per_game.values())
     se = (float(ranks.std(ddof=1) / np.sqrt(len(ranks)))
           if len(ranks) > 1 else 0.0)
     return {'mr': float(ranks.mean()), 'mr_ic95': 1.96 * se,
             'wr': float((ranks == 1).mean()), 'n_rd': n_rd, 'n_dd': n_dd,
-            'dng_pct': 100.0 * n_dd / max(n_rd, 1)}
+            'dng_pct': 100.0 * n_dd / max(n_rd, 1),
+            'n_dpid': n_dpid, 'paid_pct': 100.0 * n_dpid / max(n_rd, 1),
+            'pts_paid': float(pts_paid),
+            'n_ckan': n_ckan, 'pts_ckan': float(pts_ckan)}
 
 
 def paired_compare(base, arm, n_boot=2000, seed=777):
@@ -259,6 +276,11 @@ def paired_compare(base, arm, n_boot=2000, seed=777):
     da = np.array([arm[k]['n_danger_discards'] for k in keys], float)
     nb = np.array([base[k]['n_rl_discards'] for k in keys], float)
     na = np.array([arm[k]['n_rl_discards'] for k in keys], float)
+    # [v2d] deal-ins payés + points payés (appariés)
+    pb = np.array([base[k].get('n_dealins_paid', 0) for k in keys], float)
+    pa = np.array([arm[k].get('n_dealins_paid', 0) for k in keys], float)
+    xb = np.array([base[k].get('points_paid', 0.0) for k in keys], float)
+    xa = np.array([arm[k].get('points_paid', 0.0) for k in keys], float)
     dng_b = float(db.sum() / max(nb.sum(), 1.0))
     dng_a = float(da.sum() / max(na.sum(), 1.0))
     rel = (dng_b - dng_a) / max(dng_b, 1e-9)
@@ -283,12 +305,21 @@ def paired_compare(base, arm, n_boot=2000, seed=777):
         rel_ic = (float('nan'), float('nan'))
     q = lambda v: (float(np.percentile(v, 2.5)),
                    float(np.percentile(v, 97.5)))
+    # économie de points payés (positif = le bras paie moins) ;
+    # points NÉGATIFS (pertes) -> économie = pertes_base - pertes_arm
+    # = (-xa) - (-xb) = xa - xb
+    saved_b = (xa[idx].sum(axis=1) - xb[idx].sum(axis=1))
     return {'n_pairs': n,
             'dmr': float((ra - rb).mean()), 'dmr_ic95': q(dmr_b),
             'dng_base': dng_b, 'dng_arm': dng_a,
             'd_dng_pts': 100.0 * (dng_a - dng_b),
             'd_dng_pts_ic95': q(dpts_b),
-            'rel_dng': float(rel), 'rel_dng_ic95': rel_ic}
+            'rel_dng': float(rel), 'rel_dng_ic95': rel_ic,
+            'paid_base': int(pb.sum()), 'paid_arm': int(pa.sum()),
+            'd_paid': int(pa.sum() - pb.sum()),
+            'pts_base': float(xb.sum()), 'pts_arm': float(xa.sum()),
+            'pts_saved': float(xa.sum() - xb.sum()),
+            'pts_saved_ic95': q(saved_b)}
 
 
 def main():
@@ -391,7 +422,10 @@ def main():
                 base_games = per_game
                 print(f"[sweep] == baseline : mr={s['mr']:.3f} "
                       f"(±{s['mr_ic95']:.3f}) wr={s['wr']:.3f} | "
-                      f"dng {s['dng_pct']:.2f}% ({s['n_dd']}/{s['n_rd']})",
+                      f"dng {s['dng_pct']:.2f}% ({s['n_dd']}/{s['n_rd']}) "
+                      f"| PAYÉS {s['n_dpid']} ({s['paid_pct']:.2f}%, "
+                      f"{s['pts_paid']:.0f} pts) | chankans "
+                      f"{s['n_ckan']} ({s['pts_ckan']:.0f} pts)",
                       flush=True)
                 dev = s['mr'] - REF_MR
                 print(f"[sweep] contrôle non-régression : mr - {REF_MR} = "
@@ -419,12 +453,17 @@ def main():
                 rel_ci = (f"[{100 * rel_lo:+.1f}..{100 * rel_hi:+.1f}]"
                           if rel_lo == rel_lo else "[NA : trop peu de dng]")
                 pts_lo, pts_hi = pc['d_dng_pts_ic95']
+                sv_lo, sv_hi = pc['pts_saved_ic95']
                 print(f"[sweep]    vs baseline : Δmr={pc['dmr']:+.3f} "
                       f"[IC95 {pc['dmr_ic95'][0]:+.3f}.."
                       f"{pc['dmr_ic95'][1]:+.3f}] | réduction dng "
                       f"{100 * pc['rel_dng']:+.1f}% {rel_ci} "
                       f"(Δ {pc['d_dng_pts']:+.2f} pt, moins = mieux, "
                       f"[{pts_lo:+.2f}..{pts_hi:+.2f}]) | "
+                      f"payés {pc['paid_base']}→{pc['paid_arm']} "
+                      f"(Δ {pc['d_paid']:+d}), économie "
+                      f"{pc['pts_saved']:+.0f} pts "
+                      f"[{sv_lo:+.0f}..{sv_hi:+.0f}] | "
                       f"PORTE : {'PASSÉE' if gate_ok else 'échouée'}",
                       flush=True)
             results['arms'][label] = {
@@ -432,7 +471,11 @@ def main():
             results['arms'][label]['per_game'] = {
                 f'{c}.{e}': {'rank': g['rank_of_seat0'],
                              'rd': int(g['n_rl_discards']),
-                             'dd': int(g['n_danger_discards'])}
+                             'dd': int(g['n_danger_discards']),
+                             'dpid': int(g.get('n_dealins_paid', 0)),
+                             'pts': float(g.get('points_paid', 0.0)),
+                             'ckan': int(g.get('n_chankan_paid', 0)),
+                             'ckpts': float(g.get('points_chankan', 0.0))}
                 for (c, e), g in per_game.items()}
             with open(results_path, 'w', encoding='utf-8') as f:
                 json.dump(results, f, indent=2, ensure_ascii=False)
