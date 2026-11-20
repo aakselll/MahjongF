@@ -334,6 +334,16 @@ class GameEnv:
 
         translated = dict(result)
         translated["final_rewards"] = grp_rewards
+        # [DIAG v4] récompenses BRUTES de manche (paiements réels /1000,
+        # bâtons compris), clé ADDITIVE. Les compteurs économiques du
+        # runner (deal-ins payés, points payés) doivent lire CECI et non
+        # final_rewards, qui est façonné par le GRP quand un prédicteur
+        # est chargé (grp_rewards = phi_k - phi_{k-1}) -- bug du sweep
+        # v2d : dpid/pts mesuraient des deltas GRP, pas des paiements
+        # (55 payés/-328.4 pts vs 61/-254.8 du diag sans GRP sur les
+        # mêmes donnes, canary rd/dd identiques). Personne ne lit cette
+        # clé dans l'env : dynamique inchangée.
+        translated["raw_round_rewards"] = real_round_rewards
         translated["acting_seat"] = None
         translated["game_done"] = game_done
         translated["end_reason"] = end_reason

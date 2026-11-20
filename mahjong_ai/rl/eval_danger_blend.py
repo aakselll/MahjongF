@@ -253,6 +253,16 @@ def arm_summary(per_game):
     n_ckan = sum(int(s.get('n_chankan_paid', 0)) for s in per_game.values())
     pts_ckan = sum(float(s.get('points_chankan', 0.0))
                    for s in per_game.values())
+    # [v4] arbitrage : deal-ins VRAIS (tuile gagnante venue de l'agent,
+    # lue dans le round_env) vs FANTÔMES (bâton/honba imputés à tort par
+    # la convention ldd). LA métrique de la porte v2e doit être celle-
+    # ci (ou au minimum être décidée avec ces chiffres sous les yeux).
+    n_true = sum(int(s.get('n_dealins_true', 0)) for s in per_game.values())
+    pts_true = sum(float(s.get('points_true', 0.0))
+                   for s in per_game.values())
+    n_gho = sum(int(s.get('n_dealins_ghost', 0)) for s in per_game.values())
+    pts_gho = sum(float(s.get('points_ghost', 0.0))
+                  for s in per_game.values())
     se = (float(ranks.std(ddof=1) / np.sqrt(len(ranks)))
           if len(ranks) > 1 else 0.0)
     return {'mr': float(ranks.mean()), 'mr_ic95': 1.96 * se,
@@ -260,7 +270,9 @@ def arm_summary(per_game):
             'dng_pct': 100.0 * n_dd / max(n_rd, 1),
             'n_dpid': n_dpid, 'paid_pct': 100.0 * n_dpid / max(n_rd, 1),
             'pts_paid': float(pts_paid),
-            'n_ckan': n_ckan, 'pts_ckan': float(pts_ckan)}
+            'n_ckan': n_ckan, 'pts_ckan': float(pts_ckan),
+            'n_true': n_true, 'pts_true': float(pts_true),
+            'n_ghost': n_gho, 'pts_ghost': float(pts_gho)}
 
 
 def paired_compare(base, arm, n_boot=2000, seed=777):
@@ -425,8 +437,11 @@ def main():
                       f"dng {s['dng_pct']:.2f}% ({s['n_dd']}/{s['n_rd']}) "
                       f"| PAYÉS {s['n_dpid']} ({s['paid_pct']:.2f}%, "
                       f"{s['pts_paid']:.0f} pts) | chankans "
-                      f"{s['n_ckan']} ({s['pts_ckan']:.0f} pts)",
-                      flush=True)
+                      f"{s['n_ckan']} ({s['pts_ckan']:.0f} pts) | "
+                      f"[v4] VRAIS {s.get('n_true', 0)} "
+                      f"({s.get('pts_true', 0.0):.0f} pts) vs FANTÔMES "
+                      f"{s.get('n_ghost', 0)} "
+                      f"({s.get('pts_ghost', 0.0):.0f} pts)", flush=True)
                 dev = s['mr'] - REF_MR
                 print(f"[sweep] contrôle non-régression : mr - {REF_MR} = "
                       f"{dev:+.3f} (attendu +0.000 si mêmes réglages que "
@@ -475,7 +490,11 @@ def main():
                              'dpid': int(g.get('n_dealins_paid', 0)),
                              'pts': float(g.get('points_paid', 0.0)),
                              'ckan': int(g.get('n_chankan_paid', 0)),
-                             'ckpts': float(g.get('points_chankan', 0.0))}
+                             'ckpts': float(g.get('points_chankan', 0.0)),
+                             'true': int(g.get('n_dealins_true', 0)),
+                             'tpts': float(g.get('points_true', 0.0)),
+                             'gho': int(g.get('n_dealins_ghost', 0)),
+                             'gpts': float(g.get('points_ghost', 0.0))}
                 for (c, e), g in per_game.items()}
             with open(results_path, 'w', encoding='utf-8') as f:
                 json.dump(results, f, indent=2, ensure_ascii=False)

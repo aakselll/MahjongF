@@ -68,7 +68,8 @@ class _Slot:
                  'pending_reward', 'round_idx_per_seat', 'round_counter',
                  'grp_delta_sum', 'max_honba', 'stats',
                  'env_stats_before', 'diag_all', 'diag_rounds',
-                 'diag_round_rows', 'last_discard_danger')
+                 'diag_round_rows', 'last_discard_danger',
+                 'agent_round_seat')
 
     def __init__(self, env, agent_seat, idx=0):
         self.env = env
@@ -91,6 +92,12 @@ class _Slot:
         # était-elle dangereuse (label contrefactuel) ? Base du marquage
         # dealt_in et des compteurs "deal-ins payés" (voir _after_step).
         self.last_discard_danger = False
+        # [DIAG v4] siège de l'agent DANS le round_env (les sièges du
+        # round_env sont tournés : game_seat = (dealer + round_seat)%4,
+        # cf. _seat_mapping). Capturé au DÉBUT de chaque manche car
+        # dealer_seat est déjà celui de la manche SUIVANTE quand
+        # _after_step lit les internes du round_env terminé.
+        self.agent_round_seat = None
 
     def new_game(self, agent_seat):
         self.agent_seat = agent_seat
@@ -105,6 +112,7 @@ class _Slot:
         self.diag_rounds = []
         self.diag_round_rows = []
         self.last_discard_danger = False
+        self.agent_round_seat = None
         self.stats = {
             'env_idx': self.idx,          # [ÉTAPE 3] clé d'appariement
             'n_rounds': 0, 'n_tsumo': 0, 'n_ron': 0, 'n_exhaustive': 0,
@@ -117,9 +125,19 @@ class _Slot:
             'n_ron_paid_nodanger': 0,
             # [DIAG v3] chankans payés (ron adverse sur MON shouminkan)
             'n_chankan_paid': 0, 'points_chankan': 0.0,
+            # [DIAG v4] arbitrage vrai deal-in (tuile gagnante venue de
+            # l'agent, lue dans le round_env) vs fantôme (paiement
+            # imputé à tort par la convention ldd : bâton riichi,
+            # honba) -- cf. _after_step
+            'n_dealins_true': 0, 'points_true': 0.0,
+            'n_dealins_ghost': 0, 'points_ghost': 0.0,
+            'n_wfa_noldd': 0,
         }
         self.env_stats_before = self.env.get_stats()
         self.req = self.env.reset_round()
+        # [DIAG v4] siège round_env de l'agent pour CETTE manche
+        self.agent_round_seat = ((agent_seat - self.env.dealer_seat) % 4
+                                 if agent_seat is not None else None)
 
 
 def finalize_returns(transitions, rho=0.85):
@@ -454,7 +472,21 @@ class VecRunner:
         # mains réelles -2.8/-4.9/-6.8, cf. clé is_chankan [DIAG v3] ;
         # 19 des 80 lbl n'ont jamais été ronnés -- mains yakuless, le
         # label ignore le yaku par construction, cf. _danger_labels.)
-        pay = (float(round_rewards.get(slot.agent_seat, 0.0))
+        # [DIAG v4] compteurs économiques sur les récompenses BRUTES.
+        # ATTENTION : final_rewards est FAÇONNÉ par le GRP quand un
+        # prédicteur est chargé (game_env._final : grp_rewards =
+        # phi_k - phi_{k-1}), ce ne sont PAS des paiements. Le sweep v2d
+        # (--grp chargé) a ainsi compté des deltas GRP (55 payés /
+        # -328.4 pts) pendant que le diag v3 (grp_path=None -> brutes)
+        # comptait les paiements réels (61 / -254.8) sur les MÊMES
+        # donnes : canary rd/dd identiques mais dpid/pts incohérents.
+        # La clé additive raw_round_rewards (game_env v4) rend les
+        # compteurs corrects dans tous les cas ; repli final_rewards =
+        # env sans la clé (déjà brut sans prédicteur).
+        raw_rewards = result.get('raw_round_rewards')
+        if raw_rewards is None:
+            raw_rewards = round_rewards
+        pay = (float(raw_rewards.get(slot.agent_seat, 0.0))
                if slot.agent_seat is not None else 0.0)
         ronish = outcome in ('ron', 'multi_ron')
         # [DIAG v3] chankan : ron adverse sur le SHOUMINKAN de l'agent
@@ -463,16 +495,42 @@ class VecRunner:
         # dernière défausse -- d'où les fantômes v1 "dealt_in sans
         # label"), NI un baton riichi : compté à part.
         ckan = bool(result.get('is_chankan', False))
+        # [DIAG v4] arbitrage lu dans le round_env au moment où la
+        # manche se termine :
+        #  * win_from_agent : la dernière tuile jetée (défausse OU kakan
+        #    -- _last_discarder est posé sur les deux chemins, cf.
+        #    multi_agent) vient du siège de l'agent. Sur une issue ron,
+        #    la tuile gagnante est donc la sienne -> VRAI deal-in ;
+        #  * agent_riichi : l'agent avait déclaré riichi dans la manche
+        #    -> un paiement hors win_from_agent est alors son bâton
+        #    (-1.0) perdu sur le ron d'un autre.
+        re_ = slot.env.round_env
+        ars = slot.agent_round_seat
+        wfa = bool(ars is not None
+                   and getattr(re_, '_last_discarder', None) == ars)
+        _rii = getattr(re_, 'riichi', None)
+        ari = bool(ars is not None and _rii and _rii[ars])
         paid_ron = (ronish or outcome == 'chankan') and pay < 0.0
         if paid_ron:
             if ckan:
                 slot.stats['n_chankan_paid'] += 1
                 slot.stats['points_chankan'] += float(pay)
-            elif slot.last_discard_danger:
-                slot.stats['n_dealins_paid'] += 1
-                slot.stats['points_paid'] += float(pay)
             else:
-                slot.stats['n_ron_paid_nodanger'] += 1
+                # [DIAG v4] vérité terrain (convention ldd conservée à
+                # part pour la comparabilité v2/v3)
+                if wfa:
+                    slot.stats['n_dealins_true'] += 1
+                    slot.stats['points_true'] += float(pay)
+                    if not slot.last_discard_danger:
+                        slot.stats['n_wfa_noldd'] += 1
+                else:
+                    slot.stats['n_dealins_ghost'] += 1
+                    slot.stats['points_ghost'] += float(pay)
+                if slot.last_discard_danger:
+                    slot.stats['n_dealins_paid'] += 1
+                    slot.stats['points_paid'] += float(pay)
+                else:
+                    slot.stats['n_ron_paid_nodanger'] += 1
         if self.diag_active and slot.diag_round_rows:
             if ronish and pay < 0.0:
                 if ckan:
@@ -486,9 +544,15 @@ class VecRunner:
                     # : paiement réel mais PAS un deal-in de défausse
                     slot.diag_round_rows[-1]['stick_lost'] = True
                     slot.diag_round_rows[-1]['stick_points'] = pay
+                # [DIAG v4] champs d'arbitrage sur la ligne marquée
+                slot.diag_round_rows[-1]['win_from_agent'] = wfa
+                slot.diag_round_rows[-1]['agent_riichi'] = ari
             slot.diag_rounds.append(
                 {'round': slot.round_counter, 'outcome': outcome,
-                 'agent_pay': pay, 'n_rows': len(slot.diag_round_rows)})
+                 'agent_pay': pay, 'n_rows': len(slot.diag_round_rows),
+                 # [DIAG v4] arbitrage par manche (summary)
+                 'win_from_agent': (wfa if ronish else None),
+                 'agent_riichi': ari})
             slot.diag_all.extend(slot.diag_round_rows)
             slot.diag_round_rows = []
         slot.last_discard_danger = False
@@ -523,6 +587,12 @@ class VecRunner:
         else:
             # manche terminée mais partie en cours -> manche suivante
             slot.req = slot.env.reset_round()
+            # [DIAG v4] siège round_env de l'agent pour la manche
+            # suivante (cf. commentaire _Slot.__init__)
+            slot.agent_round_seat = ((slot.agent_seat
+                                      - slot.env.dealer_seat) % 4
+                                     if slot.agent_seat is not None
+                                     else None)
 
     @staticmethod
     def _last_transition_of(slot, seat):

@@ -246,6 +246,17 @@ def assemble(rows):
                                  dtype=bool),
         'chankan_pts': np.array([r.get('chankan_points', 0.0) for r in rows],
                                 dtype=np.float64),
+        # [DIAG v4] arbitrage : la tuile gagnante venait-elle du siège
+        # de l'agent (VRAI deal-in : _last_discarder du round_env ==
+        # agent) ? l'agent était-il riichi dans la manche (paiement
+        # -1.0 hors win_from_agent = bâton perdu sur le ron d'un
+        # autre) ?
+        'win_from_agent': np.array(
+            [bool(r.get('win_from_agent', False)) for r in rows],
+            dtype=bool),
+        'agent_riichi': np.array(
+            [bool(r.get('agent_riichi', False)) for r in rows],
+            dtype=bool),
         'chunk': np.array([r['chunk'] for r in rows], dtype=np.int64),
         'env': np.array([r['env_idx'] for r in rows], dtype=np.int64),
         'round': np.array([r['round'] for r in rows], dtype=np.int64),
@@ -305,6 +316,67 @@ def analyze(dat, taus, lams, p_blind, out_json=None):
         else 0.0,
     }
     rep['integrity_mismatch'] = int((dat['lbl_dd'] != dd).sum())
+
+    # --- [DIAG v4] arbitrage VRAI deal-in vs FANTÔME ------------------ #
+    # Le marquage v2/v3 (ldd = dernière défausse lbl) attrape des
+    # fantômes : agent riichi dont la dernière défausse était lbl par
+    # hasard quand un autre siège défausse la tuile gagnante -> le
+    # paiement de l'agent est son BÂTON, pas un deal-in. win_from_agent
+    # (lu dans le round_env à la fin de manche) tranche : la tuile
+    # gagnante est-elle venue de l'agent ?
+    wfa = dat.get('win_from_agent', np.zeros(N, bool))
+    ari = dat.get('agent_riichi', np.zeros(N, bool))
+    true_dd = paid & wfa
+    ghost_dd = paid & ~wfa
+    stick = dat['stick_lost']
+    # sticks à -1.0 = vrais bâtons ; |stick_pts| > 1.05 = paiements
+    # d'une autre nature (chankans non séparés si la clé is_chankan
+    # de l'env manque, honba, pao...) : à arbitrer au cas par cas
+    big_stick = stick & (dat['stick_pts'] < -1.05)
+    rep['v4_arbitration'] = {
+        'n_paid_true': int(true_dd.sum()),
+        'pts_paid_true': float(dat['points'][true_dd].sum()),
+        'n_paid_ghost': int(ghost_dd.sum()),
+        'pts_paid_ghost': float(dat['points'][ghost_dd].sum()),
+        'n_ghost_riichi': int((ghost_dd & ari).sum()),
+        'n_ghost_noriichi': int((ghost_dd & ~ari).sum()),
+        'n_stick_baton': int((stick & ~big_stick).sum()),
+        'n_stick_big': int(big_stick.sum()),
+        'pts_stick_big': float(dat['stick_pts'][big_stick].sum()),
+        'n_wfa_noldd': int((wfa & paid & ~dat['lbl_dd']).sum()),
+    }
+    # table des événements payés (pour la réponse humaine)
+    TILE34 = ([f'{n}m' for n in range(1, 10)]
+              + [f'{n}p' for n in range(1, 10)]
+              + [f'{n}s' for n in range(1, 10)]
+              + ['E', 'S', 'W', 'N', 'haku', 'hatsu', 'chun'])
+    ev = []
+    for i in np.nonzero(paid | stick | ckan)[0]:
+        if ckan[i]:
+            nature = 'CHANKAN (tuile du kan, pas la défausse)'
+            pts = float(dat['chankan_pts'][i])
+        elif stick[i]:
+            nature = ('bâton probable' if not big_stick[i]
+                      else 'STICK BIG (pas un bâton : arbitrer)')
+            pts = float(dat['stick_pts'][i])
+        elif wfa[i]:
+            nature = 'VRAI deal-in (tuile gagnante = ma défausse)'
+            pts = float(dat['points'][i])
+        else:
+            if ari[i]:
+                nature = ("FANTÔME bâton (tuile gagnante d'un autre "
+                          "siège, agent riichi)")
+            else:
+                nature = ("FANTÔME SANS riichi (tuile gagnante d'un "
+                          "autre siège, agent non riichi : arbitrer)")
+            pts = float(dat['points'][i])
+        ev.append({'chunk': int(dat['chunk'][i]), 'env': int(dat['env'][i]),
+                   'round': int(dat['round'][i]),
+                   'tile': TILE34[int(dat['A'][i])],
+                   'p': float(dat['p_ch'][i]), 'points': pts,
+                   'win_from_agent': bool(wfa[i]),
+                   'agent_riichi': bool(ari[i]), 'nature': nature})
+    rep['v4_events'] = ev
 
     # --- tête danger EN LIVE sur la trajectoire d'éval ---------------- #
     live = {'auc': float(auc_rank(D[M], dat['P'][M])),
@@ -413,6 +485,26 @@ def print_report(rep, taus, lams):
         print(f"[diag] paiements NON imputables restants (baton riichi "
               f"perdu / honba) : {n_stick} manches, "
               f"{integ.get('stick_points', 0.0):.1f} pts", flush=True)
+    # [DIAG v4] verdict de l'arbitrage vrai deal-in vs fantôme
+    v4 = rep.get('v4_arbitration')
+    if v4:
+        print(f"[diag v4] ARBITRAGE (tuile gagnante venue de l'agent ?) : "
+              f"{v4['n_paid_true']} VRAIS deal-ins "
+              f"({v4['pts_paid_true']:.1f} pts) vs "
+              f"{v4['n_paid_ghost']} FANTÔMES "
+              f"({v4['pts_paid_ghost']:.1f} pts, dont "
+              f"{v4['n_ghost_riichi']} avec agent riichi = bâton) | "
+              f"sticks : {v4['n_stick_baton']} bâtons -1.0 + "
+              f"{v4['n_stick_big']} BIG "
+              f"({v4['pts_stick_big']:.1f} pts, chankans si la clé "
+              f"is_chankan manquait) | wfa sans lbl : "
+              f"{v4['n_wfa_noldd']}", flush=True)
+        for e in rep.get('v4_events', []):
+            print(f"[diag v4]   {e['chunk']}:{e['env']} r{e['round']:02d} "
+                  f"{e['tile']:5s} p={e['p']:.4f} {e['points']:+.1f} pts "
+                  f"wfa={int(e['win_from_agent'])} "
+                  f"riichi={int(e['agent_riichi'])} -> {e['nature']}",
+                  flush=True)
     print(f"[diag] intégrité : dealt_in sans label : {n_gh}"
           + (" (ATTENDU 0 avec le marquage v2 !)" if n_gh
              else " (ok)")
@@ -616,6 +708,8 @@ def main():
         stick_pts=dat['stick_pts'].astype(np.float32),
         chankan_paid=dat['chankan_paid'],
         chankan_pts=dat['chankan_pts'].astype(np.float32),
+        win_from_agent=dat['win_from_agent'],
+        agent_riichi=dat['agent_riichi'],
         chunk=dat['chunk'], env=dat['env'], round=dat['round'])
     summary_path = os.path.join(args.out, 'diag_summary.json')
     rep = analyze(dat, taus, lams, args.p_blind, out_json=summary_path)
